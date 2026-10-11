@@ -4,6 +4,7 @@ import type {Env} from '../src/types';
 import {all,one,run,setSetting} from '../src/db';
 import {call,reconcileIssued,RetryLater} from '../src/operations';
 import {BotCoordinator} from '../src/bot';
+import {failOperationCompletion} from './completion-fault';
 import worker from '../src/index';
 
 const e=env as unknown as Env;
@@ -41,7 +42,7 @@ describe('paused journal reconciliation',()=>{
  it('recovers a successful response after D1 completion fails even when persistent pause is already set',async()=>{
   const client=directClient();
   vi.mocked(fetch).mockResolvedValueOnce(Response.json({ok:true,result:{message_id:999}}));
-  const broken={...client,DB:{prepare:e.DB.prepare.bind(e.DB),batch:async()=>{throw new Error('D1 completion failed');}}} as Env;
+  const broken={...client,DB:failOperationCompletion(e.DB,'D1 completion failed')};
   await expect(call(broken,'d1-completion','copyMessage',{chat_id:20001,from_chat_id:e.ADMIN_CHAT_ID,message_id:1})).rejects.toThrow('D1 completion failed');
   expect(await one(e,"SELECT phase FROM operations WHERE op_key='initial:d1-completion'")).toEqual({phase:'issued'});
   await setSetting(e,'paused','1');

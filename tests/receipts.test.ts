@@ -130,16 +130,28 @@ describe('durable administrator receipts', () => {
     const apply = await job();
     const db = e.DB;
     let interrupt = true;
-    // D1 statement internals are intentionally not assumed; intercept the
-    // receipt-result batch by its three statements (ledger batch has two).
+    const receiptWrites = new WeakSet<D1PreparedStatement>();
+    // Select the receipt write itself, not a batch length shared by preflight.
+    // The API and operation ledger must already have confirmed success.
     e.DB = new Proxy(db,{get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!sql.startsWith("UPDATE receipts SET phase='visible'")) return statement;
+        return new Proxy(statement,{get(prepared,key) {
+          if (key === 'bind') return (...args: unknown[]) => {const bound=prepared.bind(...args);receiptWrites.add(bound);return bound;};
+          const value=Reflect.get(prepared,key);return typeof value === 'function' ? value.bind(prepared) : value;
+        }});
+      };
       if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
-        if (interrupt && statements.length === 3) {interrupt=false;throw new Error('receipt write interrupted');}
+        if (interrupt && statements.some(statement=>receiptWrites.has(statement))) {interrupt=false;throw new Error('receipt write interrupted');}
         return target.batch(statements);
       };
       const value = Reflect.get(target,property);return typeof value === 'function' ? value.bind(target) : value;
     }});
     await expect(handleReaction(e,apply)).rejects.toThrow('receipt write interrupted');
+    expect(requests).toHaveLength(1);
+    expect(await one(e,"SELECT phase,updated_at FROM operations WHERE op_key='initial:receipt:101:1:apply:1'")).toEqual({phase:'success',updated_at:100000});
+    expect(await one(e,'SELECT phase,shown_at,clear_after FROM receipts WHERE admin_id=101')).toEqual({phase:'pending',shown_at:null,clear_after:null});
     time += 15000;
     await handleReaction(e,apply);
     expect(requests).toHaveLength(1);

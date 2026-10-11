@@ -62,4 +62,10 @@ export async function audit(e: Env, event: string, detail: Params = {}) {
  const results=await e.DB.batch([...epochGate,stmt(e,'INSERT INTO audit_logs(event,detail,created_at) VALUES(?,?,?)',event,JSON.stringify(detail),time),...logOutboxStatements(e,time)]);
  if(results.slice(epochGate.length+1).some(result=>result.meta.changes>0))await wakeLogs(e);
 }
-export async function nextJob(e: Env, key: string) {return one<Job>(e, "SELECT * FROM jobs WHERE user_key=? AND state IN ('pending','retry','running') AND epoch=? ORDER BY CASE WHEN user_key='system' AND kind='bootstrap' THEN 0 ELSE 1 END,id LIMIT 1",key,e.RECOVERY_EPOCH);}
+const nextJobStatement=(e:Env,key:string)=>stmt(e,"SELECT * FROM jobs WHERE user_key=? AND state IN ('pending','retry','running') AND epoch=? ORDER BY CASE WHEN user_key='system' AND kind='bootstrap' THEN 0 ELSE 1 END,id LIMIT 1",key,e.RECOVERY_EPOCH);
+export async function nextJob(e: Env, key: string) {return nextJobStatement(e,key).first<Job>();}
+/** Read pause state and the ordered job in one consistent database batch. */
+export async function nextWork(e:Env,key:string) {
+ const [pause,jobs]=await e.DB.batch([stmt(e,"SELECT key FROM settings WHERE key='paused' AND value='1'"),nextJobStatement(e,key)]);
+ return {paused:pause.results.length>0,job:(jobs.results[0] as unknown as Job|undefined)??null};
+}

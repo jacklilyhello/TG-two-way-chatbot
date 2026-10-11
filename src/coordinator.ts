@@ -1,5 +1,5 @@
 import type {Env,Job,TGUpdate} from './types';
-import {nextJob,one,run,setting,now,audit,scheduleLogs} from './db';
+import {nextJob,nextWork,run,setting,stmt,now,audit,scheduleLogs} from './db';
 import {RetryLater} from './operations';
 import {handleAdmin,handleCard} from './admin';
 import {handleMessage,clearConversation,handleReaction,handleDeliveryNotice,handleDeliveryRetry} from './messaging';
@@ -24,9 +24,9 @@ export class ConversationCoordinator {
   const {epoch}=await r.json<{epoch:string}>();
   if(epoch!==this.env.RECOVERY_EPOCH||!this.state.id.equals(this.env.CONVERSATIONS.idFromName('system')))return new Response('Invalid wake',{status:409});
   await this.state.storage.put('key','system');
-  const job=await nextJob(this.env,'system');
+  const {job,paused}=await nextWork(this.env,'system');
   if(job) {
-   const due=this.env.PAUSED==='true'||await setting(this.env,'paused')==='1'?now()+60000:Math.max(now()+100,job.due_at);
+   const due=this.env.PAUSED==='true'||paused?now()+60000:Math.max(now()+100,job.due_at);
    const alarm=await this.state.storage.getAlarm();
    if(alarm===null||due<alarm)await this.state.storage.setAlarm(due);
   }
@@ -36,9 +36,9 @@ export class ConversationCoordinator {
   const {key,epoch}=await r.json<{key?:unknown;epoch?:unknown}>();
   if(typeof key!=='string'||!key||key.length>100||epoch!==this.env.RECOVERY_EPOCH||!this.state.id.equals(this.env.CONVERSATIONS.idFromName(key)))return new Response('Invalid wake',{status:409});
   await this.state.storage.put('key',key);
-  const job=await nextJob(this.env,key);
+  const {job,paused}=await nextWork(this.env,key);
   if(job) {
-   const due=this.env.PAUSED==='true'||await setting(this.env,'paused')==='1'?now()+60000:Math.max(now()+100,job.due_at);
+   const due=this.env.PAUSED==='true'||paused?now()+60000:Math.max(now()+100,job.due_at);
    const alarm=await this.state.storage.getAlarm();
    if(alarm===null||due<alarm)await this.state.storage.setAlarm(due);
   }
@@ -46,19 +46,30 @@ export class ConversationCoordinator {
  }
  private async drain(key:string) {
   for(let i=0;i<16;i++) {
-   if(this.env.PAUSED==='true'||await setting(this.env,'paused')==='1') {await this.state.storage.setAlarm(now()+60000);return;}
+   if(this.env.PAUSED==='true') {await this.state.storage.setAlarm(now()+60000);return;}
    // A completed/failed batch leaves a durable continuation for remaining
    // events. Its future minute slot is driven by this DO's Alarm, without Cron.
-   if(key==='system')await scheduleLogs(this.env);
-   const job=await nextJob(this.env,key);if(!job)return;
+   let job:Job|null;
+   if(key==='system') {
+    if(await setting(this.env,'paused')==='1') {await this.state.storage.setAlarm(now()+60000);return;}
+    await scheduleLogs(this.env);job=await nextJob(this.env,key);
+   } else {
+    const work=await nextWork(this.env,key);
+    if(work.paused) {await this.state.storage.setAlarm(now()+60000);return;}
+    job=work.job;
+   }
+   if(!job)return;
    if(job.due_at>now()) {await this.state.storage.setAlarm(job.due_at);return;}
    const started=now();
    await run(this.env,"UPDATE jobs SET state='running',attempts=attempts+1,first_started_at=COALESCE(first_started_at,?) WHERE id=?",started,job.id);
    try {
-    await execute(this.env,job);
-    await run(this.env,"UPDATE jobs SET state='done',error=NULL,completed_at=?,execution_ms=execution_ms+? WHERE id=? AND state='running'",now(),Math.max(0,now()-started),job.id);
+    await execute(this.env,job,promise=>this.state.waitUntil(promise));
+    const completed=now();
     // Edits waiting for original mapping do not block new-message dependencies.
-    await run(this.env,"UPDATE jobs SET state='pending',due_at=? WHERE user_key=? AND state='waiting' AND EXISTS(SELECT 1 FROM messages m WHERE m.source_chat=CAST(json_extract(jobs.payload,'$.update.edited_message.chat.id') AS TEXT) AND m.source_id=json_extract(jobs.payload,'$.update.edited_message.message_id') AND m.delivery!='pending')",now(),key);
+    await this.env.DB.batch([
+     stmt(this.env,"UPDATE jobs SET state='done',error=NULL,completed_at=?,execution_ms=execution_ms+? WHERE id=? AND state='running'",completed,Math.max(0,completed-started),job.id),
+     stmt(this.env,"UPDATE jobs SET state='pending',due_at=? WHERE user_key=? AND state='waiting' AND EXISTS(SELECT 1 FROM messages m WHERE m.source_chat=CAST(json_extract(jobs.payload,'$.update.edited_message.chat.id') AS TEXT) AND m.source_id=json_extract(jobs.payload,'$.update.edited_message.message_id') AND m.delivery!='pending')",completed,key)
+    ]);
    } catch(error) {
     const delay=error instanceof RetryLater?error.due:now()+Math.min(60000,1000*2**Math.min(job.attempts,6));
     if(!(error instanceof RetryLater)&&job.attempts>=8) {
@@ -73,7 +84,7 @@ export class ConversationCoordinator {
   await this.state.storage.setAlarm(now()+100);
  }
 }
-export async function execute(e:Env,j:Job) {
+export async function execute(e:Env,j:Job,waitUntil?:(promise:Promise<unknown>)=>void) {
  const p=JSON.parse(j.payload);
  if(j.kind==='card'){await handleCard(e,j);return;}
  if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j);return;}
@@ -84,7 +95,7 @@ export async function execute(e:Env,j:Job) {
  if(j.kind==='clear') {const u=await user(e,j.user_key);if(u)await clearConversation(e,j,u,p.batchId);return;}
  const update=p.update as TGUpdate;
  if(!update)return;
- if(await handleAdmin(e,j,update))return;
+ if(await handleAdmin(e,j,update,waitUntil))return;
  const message=update.message??update.edited_message;
- if(message)await handleMessage(e,j,message,!!update.edited_message);
+ if(message)await handleMessage(e,j,message,!!update.edited_message,waitUntil);
 }
