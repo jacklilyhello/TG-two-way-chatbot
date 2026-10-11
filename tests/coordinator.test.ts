@@ -44,7 +44,8 @@ describe('durable scheduling',()=>{
   const response=await stub.fetch('https://conversation/wake',{method:'POST',body:JSON.stringify({key:'42'})});await response.text();
   expect(await one(e,'SELECT delivery,admin_id FROM messages WHERE source_id=501')).toEqual({delivery:'success',admin_id:701});
   expect(await one(e,'SELECT state,epoch FROM jobs WHERE dedupe=?',`route:${source!.id}:1`)).toEqual({state:'done',epoch:e.RECOVERY_EPOCH});
-  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  expect(await one(e,"SELECT state FROM jobs WHERE kind='card' AND user_key='card:42'")).toEqual({state:'pending'});
  });
  it('never promotes an old-generation pending mapping gap into a new send',async()=>{
   await run(e,"INSERT INTO users(tgid,first_contact,thread_id,binding_version) VALUES('42',1,77,1)");

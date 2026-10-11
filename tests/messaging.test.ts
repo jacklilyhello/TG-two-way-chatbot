@@ -2,8 +2,8 @@ import {env} from 'cloudflare:test';
 import {beforeEach, describe, expect, it} from 'vitest';
 import type {Env, Job, MessageRow, Params, TGMessage, UserRow} from '../src/types';
 import {all, one, run, stmt, user} from '../src/db';
-import {clearConversation, deleteSingle, handleMessage, handleReaction} from '../src/messaging';
-import {call, type Outcome} from '../src/operations';
+import {clearConversation, deleteSingle, handleDeliveryNotice, handleMessage, handleReaction} from '../src/messaging';
+import {call, RetryLater, type Outcome} from '../src/operations';
 import {accept} from '../src/ingress';
 import {handleAdmin} from '../src/admin';
 
@@ -77,10 +77,13 @@ describe('persistent messaging and deletion invariants', () => {
     await handleMessage(e, job(10, m), m, false);
     await handleMessage(e, job(10, m), m, false);
     expect(requests.filter(r => r.method === 'copyMessage')).toHaveLength(1);
+    expect(requests.filter(r => r.method === 'setMessageReaction')).toHaveLength(0);
+    const apply = await one<Job>(e, "SELECT * FROM jobs WHERE kind='reaction'");
+    await handleReaction(e, apply!);
     expect(requests.filter(r => r.method === 'setMessageReaction')).toHaveLength(1);
     expect(await one(e, 'SELECT delivery,private_id FROM messages WHERE source_id=101')).toEqual({delivery: 'success', private_id: 801});
     expect(requests.some(r => r.method === 'deleteMessage')).toBe(false);
-    const repair = await one<Job>(e, "SELECT * FROM jobs WHERE kind='reaction'");
+    const repair = await one<Job>(e, "SELECT * FROM jobs WHERE kind='reaction' AND json_extract(payload,'$.attempt')=2");
     expect(repair).not.toBeNull();
     handler = normal;
     await handleReaction(e, repair!);
@@ -98,6 +101,41 @@ describe('persistent messaging and deletion invariants', () => {
     expect(requests.filter(r => r.method === 'copyMessage')).toHaveLength(1);
     expect(await one(e, 'SELECT delivery,private_id FROM messages WHERE source_id=102')).toEqual({delivery: 'unknown', private_id: null});
     expect(requests.some(r => r.method === 'setMessageReaction')).toBe(false);
+  });
+
+  it('recovers a rate-limited failure notice independently without repeating content or its audit', async () => {
+    const m = adminMessage(180);
+    await record(m);
+    const normal = handler;
+    handler = request => request.method === 'copyMessage' ? {status:'failed',code:403,reason:'Forbidden: bot was blocked by the user'} : normal(request);
+    await handleMessage(e,job(180,m),m,false);
+    const notice = (await one<Job>(e,"SELECT * FROM jobs WHERE kind='delivery-notice'"))!;
+    expect(notice.user_key).toMatch(/^notice:/);
+    const bot = e.BOT;
+    let delayed = false;
+    e.BOT = {idFromName:(name:string)=>name,get:(id:DurableObjectId)=>({fetch:async (url:string,init:RequestInit)=>{
+      const request = JSON.parse(init.body as string) as Request;
+      if (!delayed && request.method === 'sendMessage') {delayed=true;return Response.json({due:Date.now()+1000},{status:429});}
+      return bot.get(id).fetch(url,init);
+    }})} as unknown as DurableObjectNamespace;
+    await expect(handleDeliveryNotice(e,notice)).rejects.toBeInstanceOf(RetryLater);
+    await handleMessage(e,job(180,m),m,false);
+    await handleDeliveryNotice(e,notice);
+    await handleDeliveryNotice(e,notice);
+    expect(requests.filter(r=>r.method==='copyMessage')).toHaveLength(1);
+    expect(requests.filter(r=>r.method==='sendMessage').map(r=>r.params.text)).toEqual(['对方已拉黑机器人']);
+    expect(await all(e,"SELECT id FROM audit_logs WHERE event='delivery_failed'")).toHaveLength(1);
+  });
+
+  it('rebuilds an unknown delivery notice after interruption between mapping persistence and notice enqueue', async () => {
+    const m = adminMessage(181);
+    const row = await record(m);
+    await run(e,"UPDATE messages SET delivery='unknown' WHERE id=?",row.id);
+    await run(e,"INSERT INTO operations(op_key,method,phase,reason,created_at,updated_at) VALUES(?,'copyMessage','unknown','connection lost',0,0)",`${e.RECOVERY_EPOCH}:send:${row.id}`);
+    await handleMessage(e,job(181,m),m,false);
+    await handleDeliveryNotice(e,(await one<Job>(e,"SELECT * FROM jobs WHERE kind='delivery-notice'"))!);
+    expect(requests.filter(r=>r.method==='copyMessage')).toHaveLength(0);
+    expect(requests.filter(r=>r.method==='sendMessage').map(r=>r.params.text)).toEqual(['发生未知情况：投递结果未知，内容不会自动重发。']);
   });
 
   it('clears known blocked originals but excludes messages received after the snapshot', async () => {
@@ -122,6 +160,7 @@ describe('persistent messaging and deletion invariants', () => {
     const command = adminMessage(107, {text: '/sc', reply_to_message: adminMessage(106)});
     await deleteSingle(e, job(15, command), command, (await user(e, '42'))!);
     expect(requests.filter(r => r.method === 'deleteMessage').map(r => r.params)).toEqual([{chat_id: '42', message_id: 1106}]);
+    await handleReaction(e, (await one<Job>(e, "SELECT * FROM jobs WHERE kind='reaction'"))!);
     expect(requests.filter(r => r.method === 'setMessageReaction').map(r => r.params.reaction)).toEqual([[]]);
     expect(requests.some(r => r.method === 'sendMessage' && String(r.params.text).includes('已确认1/2'))).toBe(true);
     expect(await one(e, 'SELECT deletion FROM messages WHERE id=?', first.id)).toEqual({deletion: 'none'});

@@ -1,5 +1,6 @@
 import type {Env,TGUpdate,TGMessage,UserRow} from './types';
 import {one,stmt,now} from './db';
+import {adminBinding,internalForward} from './security';
 interface Action {token:string;kind:string;user_id:string;actor_id:string;thread_id:number;version:number;payload:string;expires_at:number;used:number}
 export function authorized(e:Env,id?:number) {return !!id&&e.ADMIN_IDS.split(',').map(s=>s.trim()).includes(String(id));}
 export function command(m:TGMessage) {return (m.text??'').startsWith('/');}
@@ -20,7 +21,7 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
  let current:UserRow|null=null;
  if(m?.chat.type==='private'&&m.from&&m.chat.id===m.from.id&&!m.from.is_bot) {uid=String(m.from.id);key=uid;}
  else if(m&&String(m.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,m.from?.id)&&!m.sender_chat) {
-  const target=m.text?.match(/^\/tj(?:@[\w]+)?\s+(\d{1,16})(?:\s|$)/);
+  const target=m.text?.match(/^\/tj(?:@[\w]+)?\s+(\d{1,16})(?:\s|$)/i);
   current=await one<UserRow>(e,'SELECT * FROM users WHERE thread_id=?',m.message_thread_id??0);
   uid=target?.[1]??current?.tgid;key=uid??'admin';dir='out';
  } else if(cb&&String(cb.message?.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,cb.from.id)) {
@@ -29,12 +30,12 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
   if(action) {uid=action.user_id;key=uid;current=await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid);}
   else key='admin';
  }
- const p={update:u};
+ const p={update:u,...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
  const sql:D1PreparedStatement[]=[
   stmt(e,'INSERT OR IGNORE INTO inbox_updates(update_id,payload,received_at) VALUES(?,?,?)',u.update_id,JSON.stringify(u),time),
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES(?,?,?,?,'pending',?,?,?)",`u:${u.update_id}`,key,'update',JSON.stringify(p),time,e.RECOVERY_EPOCH,time)
  ];
- if(m&&uid&&!u.edited_message&&(dir==='in'||(current&&current.thread_id===m.message_thread_id&&m.is_topic_message&&m.from&&!m.from.is_bot&&business(m)))) {
+ if(m&&uid&&!u.edited_message&&(dir==='in'||(current&&current.thread_id===m.message_thread_id&&m.is_topic_message&&m.from&&!m.from.is_bot&&business(m)&&!internalForward(e,m)))) {
   sql.push(stmt(e,'INSERT OR IGNORE INTO messages(user_id,direction,source_chat,source_id,admin_id,private_id,thread_id,business,media_group,received_at,payload,epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',uid,dir,String(m.chat.id),m.message_id,dir==='out'?m.message_id:null,dir==='in'?m.message_id:null,dir==='out'?m.message_thread_id:null,business(m)?1:0,m.media_group_id??null,time,JSON.stringify(m),e.RECOVERY_EPOCH));
   if(m.media_group_id) sql.push(stmt(e,'INSERT INTO media_groups(group_key,user_id,direction,due_at) SELECT ?,?,?,? WHERE changes()=1 ON CONFLICT(group_key) DO UPDATE SET due_at=MAX(due_at,excluded.due_at),version=version+1',`${m.chat.id}:${m.media_group_id}`,uid,dir,time+1200));
  }

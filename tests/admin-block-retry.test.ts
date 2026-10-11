@@ -1,7 +1,7 @@
 import {env} from 'cloudflare:test';
 import {describe,it,expect} from 'vitest';
 import type {Env,Job,TGUpdate,Params} from '../src/types';
-import {handleAdmin} from '../src/admin';
+import {handleAdmin,handleCard} from '../src/admin';
 import {accept} from '../src/ingress';
 import {all,one,run} from '../src/db';
 import {RetryLater} from '../src/operations';
@@ -29,13 +29,17 @@ describe('administrator block mutation retry boundaries',()=>{
   await accept(e,callback);await accept(e,callback);
   expect(await one(e,'SELECT COUNT(*) n FROM inbox_updates WHERE update_id=?',id)).toEqual({n:1});
   expect(await one(e,'SELECT COUNT(*) n FROM jobs WHERE dedupe=?',`u:${id}`)).toEqual({n:1});
-  await expect(handleAdmin(e,job,callback)).rejects.toBeInstanceOf(RetryLater);
+  expect(await handleAdmin(e,job,callback)).toBe(true);
   expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:desired});
   expect(await one(e,'SELECT used FROM callback_actions WHERE token=?',token)).toEqual({used:id+1});
-  await expect(handleAdmin(e,job,callback)).rejects.toBeInstanceOf(RetryLater);
+  await run(e,"UPDATE jobs SET state='done' WHERE dedupe=?",`u:${id}`);
+  const card=(await one<Job>(e,"SELECT * FROM jobs WHERE kind='card'"))!;
+  await expect(handleCard(e,card)).rejects.toBeInstanceOf(RetryLater);
+  await expect(handleCard(e,card)).rejects.toBeInstanceOf(RetryLater);
+  await handleCard(e,card);
   await handleAdmin(e,job,callback);
   expect(await all(e,"SELECT event FROM audit_logs WHERE event IN ('user_blocked','user_unblocked')")).toEqual([{event}]);
-  expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${id}:card:pin:500`)).toEqual({phase:'success'});
+  expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${card.id}:card:pin:500`)).toEqual({phase:'success'});
   expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${id}:answer:synthetic-block-callback`)).toEqual({phase:'success'});
  });
  it('rolls back state, callback consumption and audit together when its D1 transaction fails',async()=>{

@@ -1,8 +1,11 @@
 import type {Env, Job, MessageRow, Params, TGMessage, TGUpdate, UserRow} from './types';
-import {all, audit, enqueue, now, one, run, setting, stmt, user} from './db';
+import {all, audit, enqueue, now, one, run, setting, stmt, user, wakeWork} from './db';
 import {call, notify, RetryLater, type Outcome} from './operations';
-import {ensureThread, ensureUser, refreshCard} from './admin';
+import {ensureThread, ensureUser, scheduleCard} from './admin';
 import {DEFAULT_FIXED_TEXT} from './settings';
+import {syncReceipt} from './receipts';
+import {internalForward, admittedBindingMatches, albumMemberBindingMatches} from './security';
+export {handleReaction} from './receipts';
 
 const CLEAR_LIMIT = 20;
 const ALBUM_QUIET_MS = 1200;
@@ -34,43 +37,43 @@ async function recordOutcome(e: Env, row: MessageRow, outcome: Outcome, thread: 
 async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome) {
   if (outcome.status === 'success') return;
   if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
-  await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason});
+  if (!await one(e, "SELECT id FROM audit_logs WHERE event=? AND json_extract(detail,'$.message')=? LIMIT 1",`delivery_${outcome.status}`,row.id)) await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason});
   if (row.direction !== 'out') return;
   const text = outcome.status === 'unknown' ? '发生未知情况：投递结果未知，内容不会自动重发。' : /bot was blocked by the user/i.test(outcome.reason) ? '对方已拉黑机器人' : `未送达，请重试。${outcome.reason ? `原因：${outcome.reason}` : ''}`;
-  await notify(e, `delivery-notice:${row.id}`, row.thread_id, text);
+  await enqueue(e, `notice:${row.id}`, 'delivery-notice', {rowId:row.id,status:outcome.status,text}, `delivery-notice:${row.id}`);
+  await wakeWork(e, `notice:${row.id}`);
 }
 
-async function reaction(e: Env, key: string, thread: number | null, messageId: number, emoji: '👍' | '👎' | null) {
-  const outcome = await call(e, key, 'setMessageReaction', {chat_id: e.ADMIN_CHAT_ID, message_id: messageId, reaction: emoji ? [{type: 'emoji', emoji}] : []});
-  if (outcome.status !== 'success') {
-    await audit(e, 'reaction_exception', {key, status: outcome.status, code: outcome.code});
-    const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE admin_id=? ORDER BY id DESC LIMIT 1', messageId);
-    if (row) await enqueue(e, row.user_id, 'reaction', {rowId: row.id, emoji, attempt: 1, parentKey: key}, `${key}:repair:1`, 3000);
-    await notify(e, `${key}:notice`, thread, '状态标记异常；已确认的发送或删除结果不变，内容不会因此重发。');
+/** A notification retry must not run the original content job again. */
+export async function handleDeliveryNotice(e: Env, job: Job): Promise<void> {
+  const p = JSON.parse(job.payload) as {rowId:number;status:string;text:string};
+  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?',p.rowId);
+  if (!row || row.direction !== 'out' || row.epoch !== e.RECOVERY_EPOCH || row.delivery !== p.status || !['failed','unknown'].includes(p.status) || typeof p.text !== 'string') return;
+  const outcome = await notify(e, `delivery-notice:${row.id}`, row.thread_id, p.text);
+  if (outcome.status !== 'success') await audit(e, 'delivery_notice_exception', {message:row.id,status:outcome.status,code:outcome.code});
+}
+
+/** Recover a crash between recording a terminal delivery and queuing its
+ * administrator notice. Read the ledger only; no content request is issued. */
+async function restoreDeliveryNotice(e: Env, row: MessageRow) {
+  if (row.direction !== 'out' || !['failed','unknown'].includes(row.delivery) || await one(e,'SELECT id FROM jobs WHERE dedupe=?',`delivery-notice:${row.id}`)) return;
+  let key = `send:${row.id}`;
+  if (row.media_group) {
+    const batch = await one<{batch_key:string}>(e, 'SELECT batch_key FROM media_batches WHERE EXISTS(SELECT 1 FROM json_each(members) WHERE value=?) ORDER BY rowid DESC LIMIT 1',row.id);
+    if (batch) key = batch.batch_key;
   }
-}
-
-/** Bounded marker-only repair; delivery is never part of this job. */
-export async function handleReaction(e: Env, job: Job): Promise<void> {
-  const p = JSON.parse(job.payload) as {rowId: number; emoji: '👍' | '👎' | null; attempt: number; parentKey: string};
-  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', p.rowId);
-  if (!row?.admin_id || !Number.isInteger(p.attempt) || p.attempt < 1 || p.attempt > 3) return;
-  let emoji = p.emoji;
-  const rows = row.media_group ? await all<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=?', row.user_id, row.direction, row.source_chat, row.media_group) : [row];
-  if (rows.every(r => r.deletion === 'deleted')) emoji = '👎';
-  else if (rows.some(r => r.tombstone || r.delivery !== 'success') || emoji === '👎') emoji = null;
-  const outcome = await call(e, `reaction-repair:${p.parentKey}:${p.attempt}`, 'setMessageReaction', {chat_id: e.ADMIN_CHAT_ID, message_id: row.admin_id, reaction: emoji ? [{type: 'emoji', emoji}] : []});
-  if (outcome.status === 'success') return;
-  await audit(e, 'reaction_repair_exception', {message: row.id, attempt: p.attempt, status: outcome.status});
-  if (p.attempt < 3) await enqueue(e, row.user_id, 'reaction', {...p, attempt: p.attempt + 1}, `${p.parentKey}:repair:${p.attempt + 1}`, 3000 * 2 ** p.attempt);
+  if (await one(e,'SELECT op_key FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}:without-reply`)) key += ':without-reply';
+  const ledger = await one<{reason:string|null;code:number|null}>(e,'SELECT reason,code FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`);
+  await deliveryNotice(e,row,{status:row.delivery as 'failed'|'unknown',reason:ledger?.reason??'请查看持久操作记录',code:ledger?.code??undefined});
 }
 
 async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<Params> {
   if (!m.reply_to_message) return {};
+  if (String(m.reply_to_message.chat.id) !== row.source_chat) return {};
   const column = row.direction === 'in' ? 'private_id' : 'admin_id';
   const target = await one<MessageRow>(e, `SELECT * FROM messages WHERE user_id=? AND ${column}=? ORDER BY id DESC LIMIT 1`, row.user_id, m.reply_to_message.message_id);
   const targetId = row.direction === 'in' ? target?.admin_id : target?.private_id;
-  if (!target || !targetId || target.tombstone || target.deletion !== 'none' || (row.direction === 'in' && target.thread_id !== row.thread_id)) {
+  if (!target || !targetId || target.tombstone || target.deletion !== 'none' || target.thread_id !== row.thread_id) {
     await audit(e, 'reply_fallback', {message: row.id, reason: '映射缺失、目标已删除或不属于当前话题'});
     return {};
   }
@@ -100,20 +103,21 @@ async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow) {
   const id = outcome.status === 'success' ? knownMessageId(outcome.result) : null;
   if (outcome.status === 'success' && id === null) outcome = {status: 'unknown', reason: 'Telegram 返回缺少有效消息 ID'};
   await recordOutcome(e, row, outcome, targetThread, id);
+  if (row.direction === 'out') await syncReceipt(e, row.id);
   await deliveryNotice(e, {...row, thread_id: targetThread}, outcome);
-  if (outcome.status === 'success' && row.direction === 'out' && !row.media_group) await reaction(e, `sent-reaction:${row.id}`, row.thread_id, row.source_id, '👍');
 }
 
 async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: string) {
   const rows = await all<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? ORDER BY source_id', row.user_id, row.direction, row.source_chat, row.media_group);
   const anchor = rows.find(r => r.admin_id !== null);
   if (!anchor?.admin_id || !rows.length) return;
+  if (!deleting) for (const member of rows) await restoreDeliveryNotice(e,member);
   const success = rows.filter(r => deleting ? r.deletion === 'deleted' : r.delivery === 'success').length;
   const pending = rows.some(r => deleting ? r.deletion === 'none' : r.delivery === 'pending');
   if (success === rows.length) {
-    if (deleting || row.direction === 'out') await reaction(e, `${scope}:album-reaction:${success}`, anchor.thread_id, anchor.admin_id, deleting ? '👎' : '👍');
+    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id);
   } else if (!pending || deleting) {
-    if (deleting || row.direction === 'out') await reaction(e, `${scope}:album-reaction:${success}`, anchor.thread_id, anchor.admin_id, null);
+    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, deleting);
     const unknown = rows.filter(r => deleting ? r.deletion === 'unknown' : r.delivery === 'unknown').length;
     await notify(e, `${scope}:album-summary:${success}:${unknown}:${rows.length}`, anchor.thread_id, `相册${deleting ? '删除' : '投递'}：已确认${success}/${rows.length}，未知${unknown}，其余${rows.length - success - unknown}。${deleting ? '仅处理选定条目，群内原件和历史保留。' : ''}`);
   }
@@ -126,7 +130,16 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
   if (group && group.due_at > now()) throw new RetryLater(group.due_at);
   const savedBatch = await one<{batch_key: string; members: string; thread_id: number | null}>(e, "SELECT batch_key,members,thread_id FROM media_batches WHERE group_key=? AND state='pending' ORDER BY rowid LIMIT 1", key);
   let members = savedBatch ? await all<MessageRow>(e, 'SELECT * FROM messages WHERE id IN (SELECT value FROM json_each(?)) ORDER BY source_id', savedBatch.members) : await all<MessageRow>(e, "SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? AND delivery='pending' AND tombstone=0 AND deletion='none' ORDER BY source_id LIMIT 10", u.tgid, row.direction, row.source_chat, m.media_group_id);
-  if (row.direction === 'out' && !savedBatch) members = members.filter(r => r.thread_id === u.thread_id);
+  let admitted = true;
+  if (row.direction === 'out') {
+    const matches = await Promise.all(members.map(member => albumMemberBindingMatches(e, member, u)));
+    admitted = matches.every(Boolean);
+    if (!savedBatch) {
+      for (const [index,member] of members.entries()) if (!matches[index]) await run(e, "UPDATE messages SET delivery='suppressed' WHERE id=? AND delivery='pending'",member.id);
+      members = members.filter((_member,index) => matches[index]);
+      admitted = true;
+    }
+  }
   if (!members.length) {
     await albumStatus(e, row, false, `album:${key}`);
     return;
@@ -143,13 +156,17 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
     const params: Params = {chat_id: row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid, media: mediaItems};
     if (row.direction === 'in') params.message_thread_id = targetThread;
     Object.assign(params, await replyParameters(e, {...members[0], thread_id: targetThread}, JSON.parse(members[0].payload) as TGMessage));
-    let outcome = await call(e, batchKey, 'sendMediaGroup', params, {messageIds: members.map(r => r.id), threadVersion: {userId: u.tgid, version: u.binding_version, threadId: targetThread ?? undefined}});
+    // A frozen batch must keep its original membership for journal recovery.
+    // An invalid admission version forbids new side effects, while call() and
+    // the Bot journal can still return an already confirmed batch mapping.
+    let outcome = await call(e, batchKey, 'sendMediaGroup', params, {messageIds: members.map(r => r.id), threadVersion: {userId: u.tgid, version: admitted ? u.binding_version : -1, threadId: targetThread ?? undefined}});
     const ids = outcome.status === 'success' && Array.isArray(outcome.result) ? outcome.result.map(knownMessageId) : [];
     if (outcome.status === 'success' && (ids.length !== members.length || ids.some(id => id === null))) outcome = {status: 'unknown', reason: '相册返回数量或消息 ID 无法对应，禁止猜测映射或重发'};
     await e.DB.batch([
       ...members.map((member, i) => stmt(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', outcome.status === 'failed' && outcome.reason === 'cancelled_by_state' ? 'suppressed' : outcome.status, row.direction === 'in' && outcome.status === 'success' ? ids[i] : null, row.direction === 'out' && outcome.status === 'success' ? ids[i] : null, targetThread, member.id)),
       stmt(e, "UPDATE media_batches SET state='done' WHERE batch_key=?", batchKey),
     ]);
+    if (row.direction === 'out') await syncReceipt(e, row.id);
     for (let i = 0; i < members.length; i++) {
       await deliveryNotice(e, {...members[i], thread_id: targetThread}, outcome);
     }
@@ -211,11 +228,16 @@ async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string
 
 /** Handles only persisted business messages. Administrative commands are routed first. */
 export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: boolean): Promise<void> {
+  if (internalForward(e, m)) return;
   const privateChat = m.chat.type === 'private' && String(m.chat.id) === String(m.from?.id) && !m.from?.is_bot;
   if (!privateChat && !authorised(e, m)) return;
   let row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE source_chat=? AND source_id=?', String(m.chat.id), m.message_id);
   let u: UserRow | null = privateChat ? await ensureUser(e, String(m.chat.id), m.from, row?.received_at ?? job.created_at) : row ? await user(e, row.user_id) : null;
   if (!u) return;
+  if (!privateChat && !await admittedBindingMatches(e, job, m, u)) {
+    if (row) await run(e, "UPDATE messages SET delivery='suppressed' WHERE id=? AND delivery='pending'", row.id);
+    return;
+  }
   if (privateChat && u.blocked) {
     if (row && !edited && row.delivery === 'pending') await run(e, "UPDATE messages SET delivery='blocked' WHERE id=?", row.id);
     return;
@@ -236,15 +258,15 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     return;
   }
   if (privateChat) {
-    u = await ensureThread(e, job, u.tgid);
+    u = await ensureThread(e, job, u.tgid, false);
     if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id}); return;}
-    await refreshCard(e, job, u.tgid);
+    await scheduleCard(e, job, u);
   }
   row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
   if (!row || row.tombstone || row.deletion !== 'none') return;
   if (m.media_group_id) {await album(e, job, row, m, u); return;}
   if (row.delivery === 'pending') await copyOne(e, row, m, u);
-  else if (row.delivery === 'success' && row.direction === 'out') await reaction(e, `sent-reaction:${row.id}`, row.thread_id, row.source_id, '👍');
+  else if (row.direction === 'out') {await syncReceipt(e, row.id);await restoreDeliveryNotice(e,row);}
 }
 
 async function recoverPrivateTarget(e: Env, row: MessageRow): Promise<void> {
@@ -289,12 +311,13 @@ async function deleteRow(e: Env, row: MessageRow, opKey: string): Promise<string
 }
 
 export async function deleteSingle(e: Env, job: Job, m: TGMessage, u: UserRow): Promise<void> {
-  if (!authorised(e, m) || m.message_thread_id !== u.thread_id || !m.reply_to_message) return;
-  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND admin_id=? ORDER BY id DESC LIMIT 1', u.tgid, m.reply_to_message.message_id);
+  if (!authorised(e, m) || m.message_thread_id !== u.thread_id || !m.reply_to_message || !await admittedBindingMatches(e, job, m, u)) return;
+  if (String(m.reply_to_message.chat.id) !== e.ADMIN_CHAT_ID || m.reply_to_message.message_thread_id !== undefined && m.reply_to_message.message_thread_id !== u.thread_id) return;
+  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND admin_id=? AND thread_id=? ORDER BY id DESC LIMIT 1', u.tgid, m.reply_to_message.message_id, u.thread_id);
   if (!row) {await notify(e, `sc:${job.id}:missing`, u.thread_id, '无法删除：新系统没有这条消息的用户端映射。'); return;}
   const result = await deleteRow(e, row, `delete:${row.id}:${job.id}`);
   if (row.media_group) await albumStatus(e, row, true, `delete:${job.id}`);
-  else if (result === 'deleted' && row.admin_id) await reaction(e, `deleted-reaction:${row.id}`, row.thread_id, row.admin_id, '👎');
+  else if (result === 'deleted' && row.admin_id) await syncReceipt(e, row.id);
   if (result !== 'deleted') await notify(e, `sc:${job.id}:result`, u.thread_id, result === 'unknown' ? '发生未知情况：删除结果未知，未标记为成功。' : result === 'unavailable' ? '未删除：消息不存在、超过限制、权限不足或没有已确认的私聊目标。' : '未删除：Telegram 明确拒绝，请查看异常记录。');
 }
 
@@ -308,7 +331,7 @@ export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: 
     const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=? AND user_id=?', item.message_id, u.tgid);
     const result = row ? await deleteRow(e, row, `clear:${batchId}:${row.id}`) : 'unavailable';
     await run(e, 'UPDATE deletion_items SET result=? WHERE batch_id=? AND message_id=?', result, batchId, item.message_id);
-    if (row?.admin_id && !row.media_group && result === 'deleted') await reaction(e, `deleted-reaction:${row.id}`, row.thread_id, row.admin_id, '👎');
+    if (row?.admin_id && !row.media_group && result === 'deleted') await syncReceipt(e, row.id);
   }
   const pending = await one<{n: number}>(e, "SELECT COUNT(*) n FROM deletion_items WHERE batch_id=? AND result='pending'", batchId);
   if (pending?.n) {
