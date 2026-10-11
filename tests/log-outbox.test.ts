@@ -112,7 +112,11 @@ describe('durable event-driven log outbox',()=>{
    const arm=instance.armLogs.bind(instance);
    instance.armLogs=async(request:Request)=>{
     await state.storage.put('self-arm-seen',true);
-    return arm(request);
+    const response=await arm(request);
+    // Read native persisted state before bootstrap resumes: its limiter retry
+    // can advance this short Alarm, which may fire before the final assertions.
+    await state.storage.put('self-arm-persisted-alarm',await state.storage.getAlarm());
+    return response;
    };
   });
   vi.mocked(fetch).mockImplementation(async request=>String(request).endsWith('/getMe')
@@ -122,7 +126,8 @@ describe('durable event-driven log outbox',()=>{
   expect(await runInDurableObject(system(),(_instance,state)=>state.storage.get('self-arm-seen'))).toBe(true);
   expect(await one(base,"SELECT COUNT(*) n FROM audit_logs WHERE event='命令菜单设置异常'")).toEqual({n:1});
   expect(await logJobs()).toHaveLength(1);
-  expect(await runInDurableObject(system(),(_instance,state)=>state.storage.getAlarm())).not.toBeNull();
+  const armedAt=await runInDurableObject(system(),(_instance,state)=>state.storage.get<number>('self-arm-persisted-alarm'));
+  expect(armedAt).toBeGreaterThan(0);
  },5000);
 
  it('continues a backlog in bounded persisted batches using Alarm without another audit or Cron',async()=>{
