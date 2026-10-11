@@ -2,6 +2,7 @@ import type {Env, Job, MessageRow, Params, TGMessage, TGUpdate, UserRow} from '.
 import {all, audit, enqueue, now, one, run, setting, stmt, user} from './db';
 import {call, notify, RetryLater, type Outcome} from './operations';
 import {ensureThread, ensureUser, refreshCard} from './admin';
+import {DEFAULT_FIXED_TEXT} from './settings';
 
 const CLEAR_LIMIT = 20;
 const ALBUM_QUIET_MS = 1200;
@@ -187,7 +188,7 @@ async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: U
 }
 
 async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string) {
-  const template = await setting(e, command === 'start' ? 'start_text' : 'help_text', command === 'start' ? '你好，{name}。请直接发送消息，管理员会人工回复。' : '请直接发送文字或媒体与管理员联系。');
+  const template = await setting(e, command === 'start' ? 'start_text' : 'help_text', DEFAULT_FIXED_TEXT[command === 'start' ? 'start' : 'help']);
   const name = [m.from?.first_name, m.from?.last_name].filter(Boolean).join(' ') || row.user_id;
   const text = template.replace(/\{(?:name|first_name|last_name|username|tgid)\}/g, token => ({'{name}': name, '{first_name}': m.from?.first_name ?? '', '{last_name}': m.from?.last_name ?? '', '{username}': m.from?.username ? `@${m.from.username}` : '未设置', '{tgid}': row.user_id}[token] ?? token));
   // Reserve the reply before sending. A concurrent clear captures this row, or

@@ -5,6 +5,7 @@ import {all, one, run, stmt, user} from '../src/db';
 import {clearConversation, deleteSingle, handleMessage, handleReaction} from '../src/messaging';
 import {call, type Outcome} from '../src/operations';
 import {accept} from '../src/ingress';
+import {handleAdmin} from '../src/admin';
 
 interface Request {key: string; method: string; params: Params}
 let e: Env;
@@ -46,6 +47,28 @@ beforeEach(async () => {
 });
 
 describe('persistent messaging and deletion invariants', () => {
+  it.each([
+    {description:'defaults',custom:false,start:'你好，{name}。请直接发送消息，管理员会人工回复。',help:'请直接发送文字或媒体与管理员联系。',startReply:'你好，Test Example。请直接发送消息，管理员会人工回复。',helpReply:'请直接发送文字或媒体与管理员联系。'},
+    {description:'saved custom templates',custom:true,start:'测试欢迎 {name}/{tgid}',help:'测试帮助 {username}',startReply:'测试欢迎 Test Example/42',helpReply:'测试帮助 @test_person'},
+  ])('shows the same $description in the panel and actual fixed replies', async templates => {
+    if (templates.custom) {
+      await run(e,"INSERT INTO settings(key,value) VALUES('start_text',?),('help_text',?)",templates.start,templates.help);
+    }
+    const panel = adminMessage(170,{text:'/mb settings',message_thread_id:undefined,is_topic_message:false});
+    expect(await handleAdmin(e,job(170,panel),{update_id:170,message:panel})).toBe(true);
+    for (const [index,command] of (['start','help'] as const).entries()) {
+      const label = command === 'start' ? '欢迎文案：\n' : '帮助文案：\n';
+      const displayed = requests.find(request=>request.method==='sendMessage'&&request.params.chat_id===e.ADMIN_CHAT_ID&&String(request.params.text).startsWith(label));
+      expect(displayed?.params.text).toBe(label+templates[command]);
+      const m = privateMessage(171+index,{text:`/${command}`,from:{id:42,first_name:'Test',last_name:'Example',username:'test_person'}});
+      await record(m);
+      await handleMessage(e,job(171+index,m),m,false);
+      expect(requests.filter(request=>request.method==='sendMessage'&&request.params.chat_id==='42').at(-1)?.params.text).toBe(command==='start'?templates.startReply:templates.helpReply);
+    }
+    expect(await all(e,"SELECT key,value FROM settings WHERE key IN ('start_text','help_text') ORDER BY key")).toEqual(templates.custom?[{key:'help_text',value:templates.help},{key:'start_text',value:templates.start}]:[]);
+    expect((await all<{business:number}>(e,'SELECT business FROM messages')).every(row=>row.business===0)).toBe(true);
+  });
+
   it('keeps confirmed delivery when reaction fails, and retries only the marker', async () => {
     const m = adminMessage(101);
     await record(m);
