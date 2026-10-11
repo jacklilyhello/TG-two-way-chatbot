@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { validateConfig, validateIsolation, renderWrangler, requireActions } from './instance-config.mjs';
-import { assertBotPermissions, assertRemoteIdentity, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease, apiClient, telegramClient } from './deployment-lib.mjs';
+import { assertBotPermissions, assertRemoteIdentity, assertQueueConsumers, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease, awaitReleaseHealth, apiClient, telegramClient } from './deployment-lib.mjs';
 
 const a = JSON.parse(await readFile(new URL('../instances/test-a.example.json', import.meta.url)));
 const b = JSON.parse(await readFile(new URL('../instances/test-b.example.json', import.meta.url)));
@@ -62,6 +62,21 @@ test('takeover and existing resource adoption require explicit evidence', () => 
   assert.throws(() => assertRemoteIdentity({ ...a, d1_id: id }, { bindings: [...bindings, { type: 'durable_object_namespace', script_name: b.worker_name }] }));
 });
 
+test('live and documented Queue consumer schemas retain strict Worker ownership', () => {
+  assertQueueConsumers([{ type: 'worker', script: a.worker_name }], a.worker_name);
+  assertQueueConsumers([{ type: 'worker', script_name: a.worker_name }], a.worker_name);
+  assertQueueConsumers([{ type: 'worker', script: a.worker_name, script_name: a.worker_name }], a.worker_name);
+  for (const consumer of [
+    { type: 'worker', script: b.worker_name },
+    { type: 'worker', script_name: b.worker_name },
+    { type: 'worker', script: a.worker_name, script_name: b.worker_name },
+    { type: 'worker' },
+    { type: 'http_pull', script: a.worker_name },
+    { script: a.worker_name },
+  ]) assert.throws(() => assertQueueConsumers([consumer], a.worker_name), /another or unidentified consumer/);
+  assertQueueConsumers([], a.worker_name);
+});
+
 test('failed secret installation never activates code or reopens outbound processing', async () => {
   let paused = false;
   let uploaded = false;
@@ -110,6 +125,28 @@ test('malformed private configuration never appears in checker diagnostics', () 
   assert.equal(unknownField.status, 1);
   assert.match(unknownField.stderr, /Unsupported instance configuration field/);
   assert(!`${unknownField.stdout}${unknownField.stderr}`.includes('PRIVATE_CONFIG_MARKER'));
+});
+
+test('read-only release readiness tolerates propagation but requires exact version and bounded attempts', async () => {
+  let requests = 0;
+  let waits = 0;
+  const version = 'a'.repeat(40);
+  await awaitReleaseHealth('https://example.invalid/health', version, {
+    wait: async () => { waits++; },
+    fetcher: async (_url, options) => {
+      assert.equal(options.method, 'GET');
+      assert.equal(options.redirect, 'error');
+      requests++;
+      if (requests === 1) throw new Error('TLS propagation');
+      if (requests === 2) return new Response('', { status: 503 });
+      return Response.json({ version: requests === 3 ? 'b'.repeat(40) : version });
+    },
+  });
+  assert.equal(requests, 4);
+  assert.equal(waits, 3);
+  let rejectedReads = 0;
+  await assert.rejects(awaitReleaseHealth('https://example.invalid/health', version, { attempts: 3, wait: async () => {}, fetcher: async () => { rejectedReads++; return Response.json({ version: 'stale' }); } }), /bounded read-only readiness/);
+  assert.equal(rejectedReads, 3);
 });
 
 test('unknown API effects are not retried and secret URLs never enter errors', async () => {

@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readManifests, validateConfig, validateIsolation, renderWrangler, requireActions } from './instance-config.mjs';
-import { apiClient, telegramClient, wrangler, assertBotPermissions, assertRemoteIdentity, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease } from './deployment-lib.mjs';
+import { apiClient, telegramClient, wrangler, assertBotPermissions, assertRemoteIdentity, assertQueueConsumers, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease, awaitReleaseHealth } from './deployment-lib.mjs';
 
 async function main() {
   requireActions();
@@ -100,7 +100,7 @@ async function main() {
     if (q.queue_id !== queue.queue_id || q.queue_name !== queue.queue_name) throw new Error('Queue identity changed during preflight');
     if ((q.consumers_total_count ?? 0) > (q.consumers?.length ?? 0)) throw new Error('Queue consumer inventory is incomplete');
     if (q.queue_id === dlqId && q.consumers?.length) throw new Error('Dead letter queue must not have an automatic consumer');
-    if (q.consumers?.some(c => c.script_name !== config.worker_name)) throw new Error('Instance queue has another consumer');
+    assertQueueConsumers(q.consumers, config.worker_name);
     if (q.producers?.some(p => p.type !== 'worker' || p.script !== config.worker_name)) throw new Error('Instance queue has another producer');
   }
   await mkdir('.local', { recursive: true, mode: 0o700 });
@@ -146,10 +146,7 @@ async function main() {
         await wrangler(['deploy', '--config', configPath], { label: 'activation with installed secrets' });
       },
     });
-    const health = await fetch(`https://${config.hostname}/health`, { redirect: 'error', signal: AbortSignal.timeout(30000) });
-    if (!health.ok) throw new Error(`Deployed health endpoint failed (HTTP ${health.status})`);
-    const state = await health.json();
-    if (state.version !== env.RELEASE_SHA) throw new Error('Health version does not match requested release');
+    await awaitReleaseHealth(`https://${config.hostname}/health`, env.RELEASE_SHA);
     if (env.CONFIGURE_WEBHOOK === 'true') {
       await telegram('setWebhook', { url: `https://${config.hostname}/webhook`, secret_token: env.TELEGRAM_WEBHOOK_SECRET, allowed_updates: ['message', 'edited_message', 'callback_query'], drop_pending_updates: false });
       const info = await telegram('getWebhookInfo');
