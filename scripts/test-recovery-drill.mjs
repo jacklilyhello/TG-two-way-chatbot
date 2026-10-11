@@ -108,7 +108,8 @@ export async function runDrill(phase, dependencies = {}) {
   const configPath = resolve(directory, 'wrangler.json');
   const statePath = resolve(directory, 'state.json');
   const evidencePath = resolve(directory, 'evidence.json');
-  let evidence = { release_sha: env.RELEASE_SHA, phase, outbound_paused: true, webhook_retry_during_restore: true };
+  let evidence = { release_sha: env.RELEASE_SHA, phase, outbound_paused: null, webhook_retry_during_restore: null };
+  let pauseAttempted = false;
   const saveEvidence = async stage => { evidence.stage = stage; await writeFile(evidencePath, JSON.stringify(evidence, null, 2), { mode: 0o600 }); };
   const settings = async () => (await cf(`${worker}/settings`)).result;
   async function query(sql, params = []) {
@@ -151,9 +152,11 @@ export async function runDrill(phase, dependencies = {}) {
     await writeFile(configPath, JSON.stringify(rendered), { mode: 0o600 });
     await invoke(['deploy','--config',configPath], { label: 'test recovery static maintenance gate' });
     assertDrillWorker(config, await settings(), { version: env.RELEASE_SHA, epoch, stage, runId: env.GITHUB_RUN_ID, namespaces: ids });
+    evidence.outbound_paused = true;
     const webhook = await fetcher(`https://${config.hostname}/webhook`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30000) });
     await webhook.body?.cancel();
     if (webhook.status !== 503) throw new Error('Maintenance webhook retry gate was not confirmed');
+    evidence.webhook_retry_during_restore = true;
     await maintenance('status', epoch);
   }
   async function list(path) {
@@ -203,7 +206,9 @@ export async function runDrill(phase, dependencies = {}) {
       const oldEpoch = assertDrillWorker(config, selected, { version: env.RELEASE_SHA });
       if (oldEpoch === config.recovery_epoch) throw new Error('New recovery epoch must differ from the currently deployed epoch');
       await unusedEpoch();
+      pauseAttempted = true;
       await maintenance('pause', oldEpoch);
+      evidence.outbound_paused = true;
       await drain(oldEpoch);
       const ids = namespaces(selected);
       await install(oldEpoch,'prepared',ids);
@@ -227,6 +232,7 @@ export async function runDrill(phase, dependencies = {}) {
       try { state = JSON.parse(await readFile(statePath,'utf8')); } catch { throw new Error('Private prepared recovery state is unavailable'); }
       if (state.config_digest !== digest(JSON.stringify(config)) || state.release !== env.RELEASE_SHA || state.run !== env.GITHUB_RUN_ID || state.bookmark !== env.RESTORE_BOOKMARK) throw new Error('Prepared recovery ownership does not match selected Environment or run');
       assertDrillWorker(config,selected,{version:env.RELEASE_SHA,epoch:state.old_epoch,stage:'prepared',runId:env.GITHUB_RUN_ID,namespaces:state.namespaces});
+      evidence.outbound_paused = true;
       if (!(await stat(resolve(directory,'database-before.sql.age'))).size) throw new Error('Encrypted pre-restore backup is unavailable');
       evidence.before = sanitizeAggregate(state.before);
       await install(state.old_epoch,'restoring',state.namespaces);
@@ -251,7 +257,7 @@ export async function runDrill(phase, dependencies = {}) {
     }
     return evidence;
   } catch (error) {
-    await saveEvidence('failed_keep_paused').catch(() => {});
+    await saveEvidence(evidence.outbound_paused === true ? 'failed_keep_paused' : pauseAttempted ? 'failed_pause_unknown' : 'failed_before_pause').catch(() => {});
     throw error;
   }
 }

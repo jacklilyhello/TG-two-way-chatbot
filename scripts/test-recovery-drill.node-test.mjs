@@ -100,6 +100,7 @@ async function fixture(t,options={}) {
       const {action}=JSON.parse(request.body);
       events.push(`maintenance-${action}`);
       assert.equal(request.headers['X-Telegram-Bot-Api-Secret-Token'],env.TELEGRAM_WEBHOOK_SECRET);
+      if(action==='pause'&&options.unknownPause)throw new Error('controlled unknown pause response');
       if(action==='pause')paused=true;
       if(action==='recover'){
         assert(restored);assert(paused);assert.equal(selected.bindings.find(item=>item.name==='PAUSED').text,'true');
@@ -151,6 +152,8 @@ test('full drill saves backup first and retains static pause through rollback, f
   assert.equal(result.stage,'restored_quarantined_still_paused');
   assert.equal(result.final.quarantined_jobs,3);
   assert.equal(result.final.unknown_operations,1);
+  assert.equal(result.outbound_paused,true);
+  assert.equal(result.webhook_retry_during_restore,true);
   assert.equal(f.settings().bindings.find(item=>item.name==='PAUSED').text,'true');
   const evidence=await readFile(join(f.directory,'evidence.json'),'utf8');
   for(const privateValue of ['PRIVATE_SQL_TEST_MARKER',env.TELEGRAM_WEBHOOK_SECRET,config.admin_chat_id,config.admin_ids[0],config.d1_id,bookmark,config.recovery_epoch])assert(!evidence.includes(privateValue));
@@ -179,7 +182,21 @@ test('foreign consumers and previously used epochs fail before any Worker or dat
     const f=await fixture(t,options);
     await assert.rejects(runDrill('prepare',f.dependencies));
     assert.deepEqual(f.events,[]);
+    const evidence=JSON.parse(await readFile(join(f.directory,'evidence.json'),'utf8'));
+    assert.equal(evidence.stage,'failed_before_pause');
+    assert.equal(evidence.outbound_paused,null);
+    assert.equal(evidence.webhook_retry_during_restore,null);
   }
+});
+
+test('unknown pause response does not claim a confirmed pause or webhook retry gate',async t=>{
+  const f=await fixture(t,{unknownPause:true});
+  await assert.rejects(runDrill('prepare',f.dependencies),/Maintenance result unknown/);
+  assert.deepEqual(f.events,['maintenance-pause']);
+  const evidence=JSON.parse(await readFile(join(f.directory,'evidence.json'),'utf8'));
+  assert.equal(evidence.stage,'failed_pause_unknown');
+  assert.equal(evidence.outbound_paused,null);
+  assert.equal(evidence.webhook_retry_during_restore,null);
 });
 
 test('restore requires saved backup and identical private configuration from the prepare phase',async t=>{
