@@ -1,6 +1,7 @@
 import type {Env, Job, MessageRow} from './types';
 import {all, audit, now, one, run, setSetting, setting, stmt, wakeWork} from './db';
 import {call, RetryLater} from './operations';
+import {latestDelivery} from './delivery-retry';
 
 export const SUCCESS_RECEIPT_MS = 10000;
 export const FAILURE_EMOJI = '😢';
@@ -54,19 +55,14 @@ export async function syncReceipt(e: Env, rowId: number, clearUntracked = false)
 }
 
 async function confirmedDelivery(e: Env, row: MessageRow): Promise<boolean> {
-  let key = `send:${row.id}`;
-  let batch: {batch_key:string;members:string} | null = null;
-  if (row.media_group) batch = await one(e,'SELECT batch_key,members FROM media_batches WHERE EXISTS(SELECT 1 FROM json_each(members) WHERE value=?) ORDER BY rowid DESC LIMIT 1',row.id);
-  if (batch) key = batch.batch_key;
-  else if (await one(e,'SELECT op_key FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}:without-reply`)) key += ':without-reply';
+  const {key,method,members} = await latestDelivery(e,row);
   const ledger = await one<{method:string;phase:string;result:string|null;reason:string|null}>(e,'SELECT method,phase,result,reason FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`);
-  if (!ledger || ledger.method !== (batch ? 'sendMediaGroup' : 'copyMessage') || ledger.phase !== row.delivery) return false;
+  if (!ledger || ledger.method !== method || ledger.phase !== row.delivery) return false;
   if (row.delivery === 'failed') return ledger.reason !== 'cancelled_by_state';
   if (row.delivery !== 'success' || !row.private_id || !ledger.result) return false;
   try {
     const result = JSON.parse(ledger.result);
-    if (!batch) return result?.message_id === row.private_id;
-    const members = JSON.parse(batch.members) as number[];
+    if (!members) return result?.message_id === row.private_id;
     return Array.isArray(result) && result.length === members.length && result[members.indexOf(row.id)]?.message_id === row.private_id;
   } catch {return false;}
 }
@@ -110,6 +106,15 @@ export async function receiptGuardValid(e: Env, guard: ReceiptGuard): Promise<bo
   const state = await currentState(e, receipt.row_id);
   if (!state || state.signature !== receipt.signature || state.emoji !== receipt.emoji) return false;
   return !guard.clear || receipt.emoji === '👍' && receipt.phase === 'visible' && receipt.clear_after !== null && receipt.clear_after <= now();
+}
+
+/** Ready cleanups get the next reaction slot before a fresh success marker.
+ * The five-second readiness window is a priority lease, not cancellation: a
+ * stalled/reconstructed lane cannot indefinitely starve every new receipt. */
+export async function dueReceiptCleanup(e:Env,time:number):Promise<boolean> {
+  const rows = await all<Receipt>(e,"SELECT r.* FROM receipts r WHERE r.epoch=? AND r.emoji='👍' AND r.phase='visible' AND r.clear_after<=? AND EXISTS(SELECT 1 FROM jobs j WHERE j.user_key='receipt:'||r.admin_id AND j.kind='reaction' AND j.epoch=r.epoch AND j.state IN ('pending','retry','running') AND j.due_at<=? AND j.due_at>=? AND json_extract(j.payload,'$.version')=r.version AND json_extract(j.payload,'$.action')='clear') ORDER BY r.clear_after,r.admin_id LIMIT 12",e.RECOVERY_EPOCH,time,time,time-5000);
+  for (const row of rows) if (await receiptGuardValid(e,{adminId:row.admin_id,version:row.version,signature:row.signature,emoji:row.emoji,clear:true})) return true;
+  return false;
 }
 
 /** Marker-only retries may converge an unknown reaction to the same desired

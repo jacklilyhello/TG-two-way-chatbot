@@ -2,7 +2,7 @@ import type {Env,Job,TGUpdate} from './types';
 import {nextJob,one,run,setting,now,audit,scheduleLogs} from './db';
 import {RetryLater} from './operations';
 import {handleAdmin,handleCard} from './admin';
-import {handleMessage,clearConversation,handleReaction,handleDeliveryNotice} from './messaging';
+import {handleMessage,clearConversation,handleReaction,handleDeliveryNotice,handleDeliveryRetry} from './messaging';
 import {user} from './db';
 import {flushLogs,bootstrap} from './logs';
 export class ConversationCoordinator {
@@ -77,6 +77,7 @@ export async function execute(e:Env,j:Job) {
  const p=JSON.parse(j.payload);
  if(j.kind==='card'){await handleCard(e,j);return;}
  if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j);return;}
+ if(j.kind==='delivery-retry'){await handleDeliveryRetry(e,j);return;}
  if(j.kind==='reaction'){await handleReaction(e,j);return;}
  if(j.kind==='bootstrap'){await bootstrap(e,j);return;}
  if(j.kind==='logs') {await flushLogs(e,j);return;}

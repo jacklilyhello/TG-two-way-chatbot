@@ -4,6 +4,7 @@ import {call, notify, RetryLater, type IssueGuard, type Outcome} from './operati
 import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {admittedBindingMatches,internalForward} from './security';
+import {reserveDeliveryRetry} from './delivery-retry';
 
 interface Action {
  token: string; kind: string; user_id: string; actor_id: string; thread_id: number | null;
@@ -400,6 +401,9 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
  if (a.kind.startsWith('card_')) {
   if (u.thread_id!==a.thread_id || u.card_id!==m.message_id) {await answer(e,job,cb.id,'旧资料卡已失效，请使用当前话题。');return;}
  } else if (payload.messageId!==m.message_id) {await answer(e,job,cb.id,'确认消息不匹配。');return;}
+ if (a.kind==='delivery_retry') {
+  await answer(e,job,cb.id,await reserveDeliveryRetry(e,job,update,a,u));return;
+ }
  if (a.kind==='card_block' || a.kind==='card_unblock') {
   const blocked = a.kind==='card_block' ? 1 : 0;
   if (a.used===0) {
