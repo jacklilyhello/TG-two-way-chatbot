@@ -1,5 +1,5 @@
 import type {Env, Job, Params, TGMessage, TGUpdate, TGUser, UserRow} from './types';
-import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user} from './db';
+import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user, logOutboxStatements, wakeLogs, logEpochStatements} from './db';
 import {call, notify, type Outcome} from './operations';
 import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
@@ -257,6 +257,30 @@ async function settingsPanel(e: Env, job: Job) {
  await notify(e,`job:${job.id}:settings:start`,null,`欢迎文案：\n${await setting(e,'start_text',DEFAULT_FIXED_TEXT.start)}`);
  await notify(e,`job:${job.id}:settings:help`,null,`帮助文案：\n${await setting(e,'help_text',DEFAULT_FIXED_TEXT.help)}`);
 }
+async function adminSettingApplied(e:Env,job:Job,key:string) {
+ if(job.epoch!==e.RECOVERY_EPOCH)throw new Error('admin_setting_epoch_mismatch');
+ const saved=await one<{applied:string|null}>(e,"SELECT json_extract(payload,'$.adminSettingApplied') applied FROM jobs WHERE id=? AND epoch=?",job.id,e.RECOVERY_EPOCH);
+ if(!saved)throw new Error('admin_setting_job_unavailable');
+ if(saved.applied!==null&&saved.applied!==key)throw new Error('admin_setting_job_mismatch');
+ return saved.applied===key;
+}
+/** The mutation, its audit and the original job's completion marker commit
+ * together. A deferred confirmation can never reapply an old setting. */
+async function applyAdminSetting(e:Env,job:Job,key:string,value:string,event:string,detail:Params,thread?:number) {
+ const epochGate=logEpochStatements(e);
+ const pending="EXISTS(SELECT 1 FROM jobs WHERE id=? AND epoch=? AND json_extract(payload,'$.adminSettingApplied') IS NULL)";
+ const available=thread===undefined?'':" AND NOT EXISTS(SELECT 1 FROM users WHERE thread_id=?) AND NOT EXISTS(SELECT 1 FROM thread_history WHERE thread_id=?)";
+ const args=[job.id,e.RECOVERY_EPOCH,...(thread===undefined?[]:[thread,thread])];
+ const results=await e.DB.batch([
+  ...epochGate,
+  stmt(e,`INSERT INTO settings(key,value) SELECT ?,? WHERE ${pending}${available} ON CONFLICT(key) DO UPDATE SET value=excluded.value`,key,value,...args),
+  stmt(e,`INSERT INTO audit_logs(event,detail,created_at) SELECT ?,?,? WHERE ${pending}${available} AND EXISTS(SELECT 1 FROM settings WHERE key=? AND value=?)`,event,JSON.stringify(detail),now(),...args,key,value),
+  stmt(e,`UPDATE jobs SET payload=json_set(payload,'$.adminSettingApplied',?) WHERE id=? AND epoch=? AND json_extract(payload,'$.adminSettingApplied') IS NULL${available} AND EXISTS(SELECT 1 FROM settings WHERE key=? AND value=?)`,key,...args,key,value),
+  ...logOutboxStatements(e)
+ ]);
+ if(results.slice(epochGate.length+3).some(result=>result.meta.changes>0))await wakeLogs(e);
+ return adminSettingApplied(e,job,key);
+}
 async function unknownOperations(e: Env, job: Job) {
  const rows = await all<{op_key:string;method:string;created_at:number}>(e,"SELECT op_key,method,created_at FROM operations WHERE phase='unknown' ORDER BY created_at DESC LIMIT 20");
  const timezone = await setting(e,'timezone','Asia/Singapore');
@@ -323,11 +347,15 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
   if (a.used===0) {
    // Audit, state change and consumption commit together. A resumed callback
    // only repairs its remaining UI operations, never reapplies the mutation.
-   await e.DB.batch([
+   const epochGate=logEpochStatements(e);
+   const mutations=await e.DB.batch([
+    ...epochGate,
     stmt(e,'INSERT INTO audit_logs(event,detail,created_at) SELECT ?,?,? FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked!=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked ? 'user_blocked' : 'user_unblocked',JSON.stringify({user:u.tgid,actor:String(cb.from.id)}),now(),u.tgid,a.version,a.thread_id,m.message_id,blocked,a.token),
     stmt(e,'UPDATE users SET blocked=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked,u.tgid,a.version,a.thread_id,m.message_id,a.token),
-    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked)
+    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked),
+    ...logOutboxStatements(e)
    ]);
+   if(mutations.slice(epochGate.length+3).some(result=>result.meta.changes>0))await wakeLogs(e);
    const applied = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',a.token);
    if (applied?.used!==stamp) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
   } else if (u.blocked!==blocked) {
@@ -432,21 +460,25 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<b
  else if (view==='unknown') await unknownOperations(e,job);
  else if (view==='logtopic') {
   const destination = Number(value);
+  const confirm=()=>notify(e,`job:${job.id}:logtopic:ok`,null,`系统日志话题已设为 ${destination}。`);
+  if(await adminSettingApplied(e,job,'log_thread_id')) {await confirm();return true;}
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(destination) || destination<=1 || await one(e,'SELECT tgid FROM users WHERE thread_id=?',destination) || await one(e,'SELECT user_id FROM thread_history WHERE thread_id=?',destination)) {
    await notify(e,`job:${job.id}:logtopic:invalid`,null,'请选择未用作用户话题的专用日志话题 ID（大于 1）。');return true;
   }
   const test = await notify(e,`job:${job.id}:logtopic:test`,destination,'管理员指定此话题作为系统日志话题。历史待报事件将继续补报。');
   if (test.status!=='success') {await notify(e,`job:${job.id}:logtopic:failed`,null,'日志话题验证未成功，配置保持原值。请检查话题与机器人权限。');return true;}
-  await run(e,"INSERT INTO settings(key,value) SELECT 'log_thread_id',? WHERE NOT EXISTS(SELECT 1 FROM users WHERE thread_id=?) AND NOT EXISTS(SELECT 1 FROM thread_history WHERE thread_id=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",String(destination),destination,destination);
-  if (await setting(e,'log_thread_id')!==String(destination)) {await notify(e,`job:${job.id}:logtopic:conflict`,null,'该话题刚被用户绑定，日志配置保持原值。');return true;}
-  await audit(e,'log_topic_changed',{thread:destination,actor:String(m.from!.id)});
-  await notify(e,`job:${job.id}:logtopic:ok`,null,`系统日志话题已设为 ${destination}。`);
+  if(!await applyAdminSetting(e,job,'log_thread_id',String(destination),'log_topic_changed',{thread:destination,actor:String(m.from!.id)},destination)) {await notify(e,`job:${job.id}:logtopic:conflict`,null,'该话题刚被用户绑定，日志配置保持原值。');return true;}
+  await confirm();
  }
  else if (view==='timezone') {
+  const confirm=()=>notify(e,`job:${job.id}:timezone:ok`,null,`时区已设为 ${value}。底层时间继续保存 UTC。`);
+  if(await adminSettingApplied(e,job,'timezone')) {await confirm();return true;}
   try {new Intl.DateTimeFormat('en',{timeZone:value}).format();} catch {await notify(e,`job:${job.id}:timezone:invalid`,null,'时区无效，请使用 IANA 时区，例如 Asia/Singapore。');return true;}
-  await setSetting(e,'timezone',value);await audit(e,'setting_changed',{key:'timezone',actor:String(m.from!.id)});
-  await notify(e,`job:${job.id}:timezone:ok`,null,`时区已设为 ${value}。底层时间继续保存 UTC。`);
+  await applyAdminSetting(e,job,'timezone',value,'setting_changed',{key:'timezone',actor:String(m.from!.id)});
+  await confirm();
  } else if (view==='start' || view==='help') {
+  const confirm=()=>notify(e,`job:${job.id}:template:ok`,null,`${view==='start'?'欢迎':'帮助'}文案已更新。`);
+  if(await adminSettingApplied(e,job,view+'_text')) {await confirm();return true;}
   const template = args.slice(view.length).trim();
   if (!template || template.length>3500 || /\{(?!name\}|first_name\}|last_name\}|username\}|tgid\})[^}]*\}/.test(template)) {
    await notify(e,`job:${job.id}:template:invalid`,null,'请输入 1–3500 字符文案。仅支持 {name}、{first_name}、{last_name}、{username}、{tgid}。');return true;
@@ -457,8 +489,8 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<b
   if (expandedLength>4096) {
    await notify(e,`job:${job.id}:template:too-long`,null,'文案变量替换后可能超过 Telegram 4096 字符限制，请减少文案长度或变量重复次数。');return true;
   }
-  await setSetting(e,view+'_text',template);await audit(e,'setting_changed',{key:view+'_text',actor:String(m.from!.id)});
-  await notify(e,`job:${job.id}:template:ok`,null,`${view==='start'?'欢迎':'帮助'}文案已更新。`);
+  await applyAdminSetting(e,job,view+'_text',template,'setting_changed',{key:view+'_text',actor:String(m.from!.id)});
+  await confirm();
  } else await notify(e,`job:${job.id}:mb:help`,null,'用法：/mb [today|7|30|all]、/mb users [页码]、/mb search TGID、/mb settings、/mb timezone 时区、/mb start 文案、/mb help 文案、/mb logtopic 话题ID、/mb unknown。');
  return true;
 }

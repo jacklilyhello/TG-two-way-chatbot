@@ -21,7 +21,7 @@ describe('durable scheduling',()=>{
   const notifications:unknown[]=[];
   await recover({...e,JOBS:{send:async(body:unknown)=>{notifications.push(body);}}} as Env);
   expect(await all(e,"SELECT state FROM jobs WHERE dedupe='old'")).toEqual([{state:'quarantined'}]);
-  expect(notifications).toEqual([{key:'43'}]);
+  expect(notifications).toEqual([{key:'43'},{key:'system'},{key:'system'}]);
  });
  it('recovers a current-generation original after a registered binding becomes available',async()=>{
   await run(e,"INSERT INTO users(tgid,first_contact,thread_id,binding_version,card_id) VALUES('42',1,77,1,99)");
@@ -33,7 +33,7 @@ describe('durable scheduling',()=>{
   await setSetting(e,'card_state:42:1',JSON.stringify([99,'','',null,1,null,0,'Asia/Singapore']));
   const notifications:unknown[]=[];
   await recover({...e,JOBS:{send:async(body:unknown)=>{notifications.push(body);}}} as Env);
-  expect(notifications).toEqual([{key:'42'}]);
+  expect(notifications).toEqual([{key:'42'},{key:'system'},{key:'system'}]);
   vi.mocked(fetch).mockImplementation(async request=>{
    const path=new URL(String(request)).pathname;
    if(path.endsWith('/getUserProfilePhotos'))return Response.json({ok:true,result:{photos:[]}});
@@ -54,7 +54,7 @@ describe('durable scheduling',()=>{
   await run(e,"INSERT INTO operations(op_key,method,phase,created_at,updated_at) VALUES(?,'copyMessage','issued',1,1)",`before-restore:send:${source!.id}`);
   const notifications:unknown[]=[];
   await recover({...e,JOBS:{send:async(body:unknown)=>{notifications.push(body);}}} as Env);
-  expect(notifications).toEqual([]);
+  expect(notifications).toEqual([{key:'system'},{key:'system'}]);
   expect(await one(e,"SELECT state FROM jobs WHERE dedupe='u:502'")).toEqual({state:'quarantined'});
   expect(await all(e,"SELECT id FROM jobs WHERE dedupe LIKE 'route:%'")).toEqual([]);
   // A duplicate queue wake after DO reconstruction must still find no eligible
