@@ -117,6 +117,20 @@ export async function runDrill(phase, dependencies = {}) {
     if (!Array.isArray(data.result) || data.result.length !== 1 || data.result[0].success !== true || !Array.isArray(data.result[0].results)) throw new Error('Scoped D1 query did not confirm success');
     return data.result[0].results;
   }
+  async function sealRestoredAudits() {
+    // The restored snapshot cannot prove which old notifications reached
+    // Telegram after its bookmark. Seal them before the fresh epoch can run;
+    // the epoch marker and seal must commit in one D1 API batch transaction.
+    const batch = [
+      { sql: 'UPDATE audit_logs SET reported=2 WHERE reported=0', params: [] },
+      { sql: "INSERT INTO settings(key,value) VALUES('log_outbox_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params: [config.recovery_epoch] }
+    ];
+    const data = await cf(`${database}/query`, { method: 'POST', body: { batch } });
+    if (!Array.isArray(data.result) || data.result.length !== batch.length || data.result.some(result => result.success !== true || !Array.isArray(result.results))) throw new Error('Restored audit seal batch did not confirm success; keep static pause');
+    const row = (await query("SELECT (SELECT COUNT(*) FROM audit_logs WHERE reported=0) unreported_audits,(SELECT COUNT(*) FROM settings WHERE key='log_outbox_epoch' AND value=?) epoch_marked", [config.recovery_epoch]))[0];
+    if (row?.unreported_audits !== 0 || row.epoch_marked !== 1) throw new Error('Restored audit seal readback did not confirm the fresh epoch; keep static pause');
+    evidence.restored_audits_sealed = true;
+  }
   const aggregate = async () => sanitizeAggregate((await query(aggregateSql, [config.recovery_epoch,config.recovery_epoch]))[0]);
   async function unusedEpoch() {
     const rows = await query("SELECT (SELECT COUNT(*) FROM jobs WHERE epoch=?) + (SELECT COUNT(*) FROM messages WHERE epoch=?) + (SELECT COUNT(*) FROM operations WHERE substr(op_key,1,length(?)+1)=?||':') n", Array(4).fill(config.recovery_epoch));
@@ -243,6 +257,7 @@ export async function runDrill(phase, dependencies = {}) {
       await invoke(['d1','migrations','apply','DB','--remote','--config',configPath],{label:'restored test schema compatibility'});
       await query("INSERT INTO settings(key,value) VALUES('paused','1') ON CONFLICT(key) DO UPDATE SET value='1'");
       await unusedEpoch();
+      await sealRestoredAudits();
       evidence.restored = await aggregate();
       await install(config.recovery_epoch,'restored',state.namespaces);
       await maintenance('recover',config.recovery_epoch);

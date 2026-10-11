@@ -48,6 +48,7 @@ async function fixture(t,options={}) {
   let restored=false;
   let recovered=false;
   let paused=false;
+  let auditsSealed=false;
   const events=[];
   const telegramMethods=[];
   const directory=join(cwd,'.local/recovery-drill');
@@ -74,9 +75,25 @@ async function fixture(t,options={}) {
       for(const [id,name]of[[config.queue_id,config.queue_name],[config.dlq_id,config.dlq_name]])if(path===`${account}/queues/${id}`)return{result:{queue_id:id,queue_name:name,consumers:id===config.queue_id?[{type:'worker',script:options.foreignConsumer?'foreign':config.worker_name}]:[]}};
       if(path===`${db}/time_travel/bookmark`)return{result:{bookmark:currentBookmark}};
       if(path===`${db}/query`){
+        if(request.body.batch){
+          assert.deepEqual(Object.keys(request.body),['batch']);
+          assert(restored);assert(paused);
+          assert.equal(selected.bindings.find(item=>item.name==='RECOVERY_DRILL_STAGE').text,'restoring');
+          const [seal,marker]=request.body.batch;
+          assert.equal(seal.sql,'UPDATE audit_logs SET reported=2 WHERE reported=0');
+          assert.deepEqual(seal.params,[]);
+          assert(marker.sql.includes("'log_outbox_epoch',?"));
+          assert(!marker.sql.includes(config.recovery_epoch));
+          assert.deepEqual(marker.params,[config.recovery_epoch]);
+          events.push('seal-restored-audits');
+          if(options.sealFailure)return{result:[{success:true,results:[]},{success:false,results:[]}]};
+          auditsSealed=true;
+          return{result:[{success:true,results:[]},{success:true,results:[]}]};
+        }
         const sql=request.body.sql;
         assert.deepEqual(Object.keys(request.body).sort(),['params','sql']);
         if(sql.startsWith('INSERT')){assert.equal(selected.bindings.find(item=>item.name==='PAUSED').text,'true');events.push('persistent-pause');paused=true;return{result:[{success:true,results:[]}]};}
+        if(sql.includes('unreported_audits'))return{result:[{success:true,results:[{unreported_audits:auditsSealed?0:1,epoch_marked:auditsSealed&&!options.sealReadbackFailure?1:0}]}]};
         if(sql.includes("substr(op_key"))return{result:[{success:true,results:[{n:options.usedEpoch?1:0}]}]};
         if(sql.includes('old_pending_messages'))return{result:[{success:true,results:[{...counts,...(recovered?{old_unfinished_jobs:0,quarantined_jobs:3}:{})}]}]};
       }
@@ -103,7 +120,7 @@ async function fixture(t,options={}) {
       if(action==='pause'&&options.unknownPause)throw new Error('controlled unknown pause response');
       if(action==='pause')paused=true;
       if(action==='recover'){
-        assert(restored);assert(paused);assert.equal(selected.bindings.find(item=>item.name==='PAUSED').text,'true');
+        assert(restored);assert(paused);assert(auditsSealed);assert.equal(selected.bindings.find(item=>item.name==='PAUSED').text,'true');
         assert.equal(selected.bindings.find(item=>item.name==='RECOVERY_EPOCH').text,config.recovery_epoch);
         recovered=true;
       }
@@ -147,6 +164,9 @@ test('full drill saves backup first and retains static pause through rollback, f
   assert(f.events.indexOf('encrypted-database-before.sql')<f.events.indexOf('restore'));
   assert(f.events.indexOf('install-restoring')<f.events.indexOf('restore'));
   assert(f.events.indexOf('persistent-pause')<f.events.indexOf('install-restored'));
+  assert(f.events.indexOf('migrations')<f.events.indexOf('seal-restored-audits'));
+  assert(f.events.indexOf('persistent-pause')<f.events.indexOf('seal-restored-audits'));
+  assert(f.events.indexOf('seal-restored-audits')<f.events.indexOf('install-restored'));
   assert(f.events.indexOf('install-restored')<f.events.indexOf('maintenance-recover'));
   assert.equal(f.events.filter(item=>item==='restore').length,1);
   assert.equal(result.stage,'restored_quarantined_still_paused');
@@ -154,9 +174,29 @@ test('full drill saves backup first and retains static pause through rollback, f
   assert.equal(result.final.unknown_operations,1);
   assert.equal(result.outbound_paused,true);
   assert.equal(result.webhook_retry_during_restore,true);
+  assert.equal(result.restored_audits_sealed,true);
   assert.equal(f.settings().bindings.find(item=>item.name==='PAUSED').text,'true');
   const evidence=await readFile(join(f.directory,'evidence.json'),'utf8');
   for(const privateValue of ['PRIVATE_SQL_TEST_MARKER',env.TELEGRAM_WEBHOOK_SECRET,config.admin_chat_id,config.admin_ids[0],config.d1_id,bookmark,config.recovery_epoch])assert(!evidence.includes(privateValue));
+});
+
+test('failed audit seal or readback keeps the restoring gate and never installs or wakes a fresh epoch',async t=>{
+  for(const options of [{sealFailure:true},{sealReadbackFailure:true}]){
+    const f=await fixture(t,options);
+    await runDrill('prepare',f.dependencies);
+    f.dependencies.env.RECOVERY_BACKUP_SAVED='true';
+    await assert.rejects(runDrill('restore',f.dependencies),/audit seal/);
+    assert.equal(f.events.filter(item=>item==='restore').length,1);
+    assert(!f.events.includes('install-restored'));
+    assert(!f.events.includes('maintenance-recover'));
+    assert.equal(f.settings().bindings.find(item=>item.name==='PAUSED').text,'true');
+    assert.equal(f.settings().bindings.find(item=>item.name==='RECOVERY_DRILL_STAGE').text,'restoring');
+    const evidence=JSON.parse(await readFile(join(f.directory,'evidence.json'),'utf8'));
+    assert.equal(evidence.stage,'failed_keep_paused');
+    assert.notEqual(evidence.restored_audits_sealed,true);
+    await assert.rejects(runDrill('restore',f.dependencies),/Static recovery pause/);
+    assert.equal(f.events.filter(item=>item==='restore').length,1);
+  }
 });
 
 test('failed encryption never restores or removes the static maintenance gate',async t=>{

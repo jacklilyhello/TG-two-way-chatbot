@@ -1,5 +1,5 @@
 import type {Env,Job,TGUpdate} from './types';
-import {nextJob,one,run,setting,now,audit} from './db';
+import {nextJob,one,run,setting,now,audit,scheduleLogs} from './db';
 import {RetryLater} from './operations';
 import {handleAdmin} from './admin';
 import {handleMessage,clearConversation,handleReaction} from './messaging';
@@ -9,6 +9,9 @@ export class ConversationCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
  fetch(r:Request):Promise<Response> {
+  // Arm-only self-calls must not join tail: audit() can await this request while
+  // the same system coordinator is executing a job on that tail.
+  if(new URL(r.url).pathname==='/logs/arm')return this.armLogs(r);
   const promise=this.tail.then(async()=>{const {key}=await r.json<{key:string}>();await this.state.storage.put('key',key);await this.drain(key);return new Response('ok');});
   this.tail=promise.catch(()=>{});return promise;
  }
@@ -16,9 +19,24 @@ export class ConversationCoordinator {
   const promise=this.tail.then(async()=>{const key=await this.state.storage.get<string>('key');if(key)await this.drain(key);});
   this.tail=promise.catch(()=>{});return promise;
  }
+ private async armLogs(r:Request) {
+  const {epoch}=await r.json<{epoch:string}>();
+  if(epoch!==this.env.RECOVERY_EPOCH||!this.state.id.equals(this.env.CONVERSATIONS.idFromName('system')))return new Response('Invalid wake',{status:409});
+  await this.state.storage.put('key','system');
+  const job=await nextJob(this.env,'system');
+  if(job) {
+   const due=this.env.PAUSED==='true'||await setting(this.env,'paused')==='1'?now()+60000:Math.max(now()+100,job.due_at);
+   const alarm=await this.state.storage.getAlarm();
+   if(alarm===null||due<alarm)await this.state.storage.setAlarm(due);
+  }
+  return new Response('ok');
+ }
  private async drain(key:string) {
-  if(this.env.PAUSED==='true'||await setting(this.env,'paused')==='1') {await this.state.storage.setAlarm(now()+60000);return;}
   for(let i=0;i<16;i++) {
+   if(this.env.PAUSED==='true'||await setting(this.env,'paused')==='1') {await this.state.storage.setAlarm(now()+60000);return;}
+   // A completed/failed batch leaves a durable continuation for remaining
+   // events. Its future minute slot is driven by this DO's Alarm, without Cron.
+   if(key==='system')await scheduleLogs(this.env);
    const job=await nextJob(this.env,key);if(!job)return;
    if(job.due_at>now()) {await this.state.storage.setAlarm(job.due_at);return;}
    await run(this.env,"UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=?",job.id);

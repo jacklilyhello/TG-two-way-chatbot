@@ -1,5 +1,5 @@
 import type {Env, Job, Params, TGMessage, TGUpdate, TGUser, UserRow} from './types';
-import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user} from './db';
+import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user, logOutboxStatements, wakeLogs, logEpochStatements} from './db';
 import {call, notify, type Outcome} from './operations';
 import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
@@ -323,11 +323,15 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
   if (a.used===0) {
    // Audit, state change and consumption commit together. A resumed callback
    // only repairs its remaining UI operations, never reapplies the mutation.
-   await e.DB.batch([
+   const epochGate=logEpochStatements(e);
+   const mutations=await e.DB.batch([
+    ...epochGate,
     stmt(e,'INSERT INTO audit_logs(event,detail,created_at) SELECT ?,?,? FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked!=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked ? 'user_blocked' : 'user_unblocked',JSON.stringify({user:u.tgid,actor:String(cb.from.id)}),now(),u.tgid,a.version,a.thread_id,m.message_id,blocked,a.token),
     stmt(e,'UPDATE users SET blocked=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked,u.tgid,a.version,a.thread_id,m.message_id,a.token),
-    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked)
+    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked),
+    ...logOutboxStatements(e)
    ]);
+   if(mutations.slice(epochGate.length+3).some(result=>result.meta.changes>0))await wakeLogs(e);
    const applied = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',a.token);
    if (applied?.used!==stamp) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
   } else if (u.blocked!==blocked) {
