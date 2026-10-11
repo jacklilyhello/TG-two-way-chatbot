@@ -1,0 +1,325 @@
+import type {Env, Job, MessageRow, Params, TGMessage, TGUpdate, UserRow} from './types';
+import {all, audit, enqueue, now, one, run, setting, stmt, user} from './db';
+import {call, notify, RetryLater, type Outcome} from './operations';
+import {ensureThread, ensureUser, refreshCard} from './admin';
+
+const CLEAR_LIMIT = 20;
+const ALBUM_QUIET_MS = 1200;
+const authorised = (e: Env, m: TGMessage) => String(m.chat.id) === e.ADMIN_CHAT_ID && !m.sender_chat && !m.from?.is_bot && e.ADMIN_IDS.split(',').map(x => x.trim()).includes(String(m.from?.id));
+const groupKey = (m: TGMessage) => `${m.chat.id}:${m.media_group_id}`;
+const sourceVersion = (job: Job) => {
+  const payload = JSON.parse(job.payload) as {update?: TGUpdate; update_id?: number};
+  return payload.update?.update_id ?? payload.update_id ?? job.id;
+};
+
+function media(m: TGMessage): Params | null {
+  const file = m.photo?.at(-1)?.file_id;
+  const entry = file ? ['photo', file] : m.video ? ['video', m.video.file_id] : m.audio ? ['audio', m.audio.file_id] : m.document ? ['document', m.document.file_id] : m.animation ? ['animation', m.animation.file_id] : null;
+  if (!entry) return null;
+  return {type: entry[0], media: entry[1], ...(m.caption !== undefined ? {caption: m.caption} : {}), ...(m.caption_entities ? {caption_entities: m.caption_entities} : {})};
+}
+
+function knownMessageId(result: unknown): number | null {
+  if (!result || typeof result !== 'object') return null;
+  const id = (result as {message_id?: unknown}).message_id;
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+async function recordOutcome(e: Env, row: MessageRow, outcome: Outcome, thread: number | null, id: number | null = null) {
+  const status = outcome.status === 'success' && id === null ? 'unknown' : outcome.status === 'failed' && outcome.code === 409 && outcome.reason === 'cancelled_by_state' ? 'suppressed' : outcome.status;
+  await run(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', status, row.direction === 'in' ? id : null, row.direction === 'out' ? id : null, thread, row.id);
+}
+
+async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome) {
+  if (outcome.status === 'success') return;
+  if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
+  await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason});
+  if (row.direction !== 'out') return;
+  const text = outcome.status === 'unknown' ? '发生未知情况：投递结果未知，内容不会自动重发。' : /bot was blocked by the user/i.test(outcome.reason) ? '对方已拉黑机器人' : `未送达，请重试。${outcome.reason ? `原因：${outcome.reason}` : ''}`;
+  await notify(e, `delivery-notice:${row.id}`, row.thread_id, text);
+}
+
+async function reaction(e: Env, key: string, thread: number | null, messageId: number, emoji: '👍' | '👎' | null) {
+  const outcome = await call(e, key, 'setMessageReaction', {chat_id: e.ADMIN_CHAT_ID, message_id: messageId, reaction: emoji ? [{type: 'emoji', emoji}] : []});
+  if (outcome.status !== 'success') {
+    await audit(e, 'reaction_exception', {key, status: outcome.status, code: outcome.code});
+    const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE admin_id=? ORDER BY id DESC LIMIT 1', messageId);
+    if (row) await enqueue(e, row.user_id, 'reaction', {rowId: row.id, emoji, attempt: 1, parentKey: key}, `${key}:repair:1`, 3000);
+    await notify(e, `${key}:notice`, thread, '状态标记异常；已确认的发送或删除结果不变，内容不会因此重发。');
+  }
+}
+
+/** Bounded marker-only repair; delivery is never part of this job. */
+export async function handleReaction(e: Env, job: Job): Promise<void> {
+  const p = JSON.parse(job.payload) as {rowId: number; emoji: '👍' | '👎' | null; attempt: number; parentKey: string};
+  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', p.rowId);
+  if (!row?.admin_id || !Number.isInteger(p.attempt) || p.attempt < 1 || p.attempt > 3) return;
+  let emoji = p.emoji;
+  const rows = row.media_group ? await all<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=?', row.user_id, row.direction, row.source_chat, row.media_group) : [row];
+  if (rows.every(r => r.deletion === 'deleted')) emoji = '👎';
+  else if (rows.some(r => r.tombstone || r.delivery !== 'success') || emoji === '👎') emoji = null;
+  const outcome = await call(e, `reaction-repair:${p.parentKey}:${p.attempt}`, 'setMessageReaction', {chat_id: e.ADMIN_CHAT_ID, message_id: row.admin_id, reaction: emoji ? [{type: 'emoji', emoji}] : []});
+  if (outcome.status === 'success') return;
+  await audit(e, 'reaction_repair_exception', {message: row.id, attempt: p.attempt, status: outcome.status});
+  if (p.attempt < 3) await enqueue(e, row.user_id, 'reaction', {...p, attempt: p.attempt + 1}, `${p.parentKey}:repair:${p.attempt + 1}`, 3000 * 2 ** p.attempt);
+}
+
+async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<Params> {
+  if (!m.reply_to_message) return {};
+  const column = row.direction === 'in' ? 'private_id' : 'admin_id';
+  const target = await one<MessageRow>(e, `SELECT * FROM messages WHERE user_id=? AND ${column}=? ORDER BY id DESC LIMIT 1`, row.user_id, m.reply_to_message.message_id);
+  const targetId = row.direction === 'in' ? target?.admin_id : target?.private_id;
+  if (!target || !targetId || target.tombstone || target.deletion !== 'none' || (row.direction === 'in' && target.thread_id !== row.thread_id)) {
+    await audit(e, 'reply_fallback', {message: row.id, reason: '映射缺失、目标已删除或不属于当前话题'});
+    return {};
+  }
+  return {reply_parameters: {message_id: targetId, allow_sending_without_reply: true}};
+}
+
+async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow) {
+  const current = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
+  if (!current || current.tombstone || current.deletion !== 'none') return;
+  const chatId = row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid;
+  const targetThread = row.thread_id ?? u.thread_id;
+  // Save routing before issuing a request so a returned result can be recovered
+  // against the actual destination even after a concurrent binding switch.
+  if (row.thread_id === null) await run(e, 'UPDATE messages SET thread_id=? WHERE id=?', targetThread, row.id);
+  const params: Params = {chat_id: chatId, from_chat_id: row.source_chat, message_id: row.source_id};
+  if (row.direction === 'in') params.message_thread_id = targetThread;
+  Object.assign(params, await replyParameters(e, {...row, thread_id: targetThread}, m));
+  const guard = {messageIds: [row.id], threadVersion: {userId: u.tgid, version: u.binding_version, threadId: targetThread ?? undefined}};
+  let outcome = await call(e, `send:${row.id}`, 'copyMessage', params, guard);
+  // Reply targets can disappear after the mapping check. Telegram explicitly rejected
+  // this request, so a single fallback without a reply cannot duplicate delivery.
+  if (outcome.status === 'failed' && /reply.*(?:not found|deleted)|message to be replied not found/i.test(outcome.reason) && params.reply_parameters) {
+    delete params.reply_parameters;
+    await audit(e, 'reply_fallback', {message: row.id, reason: 'Telegram 拒绝引用目标'});
+    outcome = await call(e, `send:${row.id}:without-reply`, 'copyMessage', params, guard);
+  }
+  const id = outcome.status === 'success' ? knownMessageId(outcome.result) : null;
+  if (outcome.status === 'success' && id === null) outcome = {status: 'unknown', reason: 'Telegram 返回缺少有效消息 ID'};
+  await recordOutcome(e, row, outcome, targetThread, id);
+  await deliveryNotice(e, {...row, thread_id: targetThread}, outcome);
+  if (outcome.status === 'success' && row.direction === 'out' && !row.media_group) await reaction(e, `sent-reaction:${row.id}`, row.thread_id, row.source_id, '👍');
+}
+
+async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: string) {
+  const rows = await all<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? ORDER BY source_id', row.user_id, row.direction, row.source_chat, row.media_group);
+  const anchor = rows.find(r => r.admin_id !== null);
+  if (!anchor?.admin_id || !rows.length) return;
+  const success = rows.filter(r => deleting ? r.deletion === 'deleted' : r.delivery === 'success').length;
+  const pending = rows.some(r => deleting ? r.deletion === 'none' : r.delivery === 'pending');
+  if (success === rows.length) {
+    if (deleting || row.direction === 'out') await reaction(e, `${scope}:album-reaction:${success}`, anchor.thread_id, anchor.admin_id, deleting ? '👎' : '👍');
+  } else if (!pending || deleting) {
+    if (deleting || row.direction === 'out') await reaction(e, `${scope}:album-reaction:${success}`, anchor.thread_id, anchor.admin_id, null);
+    const unknown = rows.filter(r => deleting ? r.deletion === 'unknown' : r.delivery === 'unknown').length;
+    await notify(e, `${scope}:album-summary:${success}:${unknown}:${rows.length}`, anchor.thread_id, `相册${deleting ? '删除' : '投递'}：已确认${success}/${rows.length}，未知${unknown}，其余${rows.length - success - unknown}。${deleting ? '仅处理选定条目，群内原件和历史保留。' : ''}`);
+  }
+}
+
+async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow) {
+  const key = groupKey(m);
+  await run(e, 'INSERT OR IGNORE INTO media_groups(group_key,user_id,direction,due_at) VALUES(?,?,?,?)', key, u.tgid, row.direction, row.received_at + ALBUM_QUIET_MS);
+  const group = await one<{due_at: number}>(e, 'SELECT due_at FROM media_groups WHERE group_key=?', key);
+  if (group && group.due_at > now()) throw new RetryLater(group.due_at);
+  const savedBatch = await one<{batch_key: string; members: string; thread_id: number | null}>(e, "SELECT batch_key,members,thread_id FROM media_batches WHERE group_key=? AND state='pending' ORDER BY rowid LIMIT 1", key);
+  let members = savedBatch ? await all<MessageRow>(e, 'SELECT * FROM messages WHERE id IN (SELECT value FROM json_each(?)) ORDER BY source_id', savedBatch.members) : await all<MessageRow>(e, "SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? AND delivery='pending' AND tombstone=0 AND deletion='none' ORDER BY source_id LIMIT 10", u.tgid, row.direction, row.source_chat, m.media_group_id);
+  if (row.direction === 'out' && !savedBatch) members = members.filter(r => r.thread_id === u.thread_id);
+  if (!members.length) {
+    await albumStatus(e, row, false, `album:${key}`);
+    return;
+  }
+  const mediaItems = members.map(r => media(JSON.parse(r.payload) as TGMessage));
+  const types = mediaItems.map(x => x?.type);
+  const compatible = mediaItems.every(x => x !== null) && (types.every(t => t === 'photo' || t === 'video') || types.every(t => t === 'audio') || types.every(t => t === 'document'));
+  if (members.length < 2 || !compatible) {
+    for (const member of members) await copyOne(e, member, JSON.parse(member.payload) as TGMessage, u);
+  } else {
+    const batchKey = savedBatch?.batch_key ?? `album-send:${key}:${members.map(r => r.id).join(',')}`;
+    const targetThread = savedBatch?.thread_id ?? u.thread_id;
+    if (!savedBatch) await run(e, 'INSERT OR IGNORE INTO media_batches(batch_key,group_key,members,thread_id) VALUES(?,?,?,?)', batchKey, key, JSON.stringify(members.map(r => r.id)), targetThread);
+    const params: Params = {chat_id: row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid, media: mediaItems};
+    if (row.direction === 'in') params.message_thread_id = targetThread;
+    Object.assign(params, await replyParameters(e, {...members[0], thread_id: targetThread}, JSON.parse(members[0].payload) as TGMessage));
+    let outcome = await call(e, batchKey, 'sendMediaGroup', params, {messageIds: members.map(r => r.id), threadVersion: {userId: u.tgid, version: u.binding_version, threadId: targetThread ?? undefined}});
+    const ids = outcome.status === 'success' && Array.isArray(outcome.result) ? outcome.result.map(knownMessageId) : [];
+    if (outcome.status === 'success' && (ids.length !== members.length || ids.some(id => id === null))) outcome = {status: 'unknown', reason: '相册返回数量或消息 ID 无法对应，禁止猜测映射或重发'};
+    await e.DB.batch([
+      ...members.map((member, i) => stmt(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', outcome.status === 'failed' && outcome.reason === 'cancelled_by_state' ? 'suppressed' : outcome.status, row.direction === 'in' && outcome.status === 'success' ? ids[i] : null, row.direction === 'out' && outcome.status === 'success' ? ids[i] : null, targetThread, member.id)),
+      stmt(e, "UPDATE media_batches SET state='done' WHERE batch_key=?", batchKey),
+    ]);
+    for (let i = 0; i < members.length; i++) {
+      await deliveryNotice(e, {...members[i], thread_id: targetThread}, outcome);
+    }
+  }
+  await albumStatus(e, row, false, `album:${key}`);
+}
+
+async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: UserRow) {
+  if (!row || row.delivery === 'pending') {
+    await run(e, "UPDATE jobs SET state='waiting',due_at=? WHERE id=?", now() + 1000, job.id);
+    return;
+  }
+  if (row.tombstone || row.deletion !== 'none' || row.delivery !== 'success' || row.thread_id !== u.thread_id || (row.direction === 'in' && u.blocked)) return;
+  const previous = JSON.parse(row.payload) as TGMessage;
+  const updateId = sourceVersion(job);
+  const editDate = m.edit_date ?? m.date;
+  const previousDate = previous.edit_date ?? previous.date;
+  if (editDate < previousDate || (editDate === previousDate && updateId < row.version)) return;
+  await run(e, 'UPDATE messages SET version=?,payload=? WHERE id=?', updateId, JSON.stringify(m), row.id);
+  const params: Params = {chat_id: row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid, message_id: row.direction === 'in' ? row.admin_id : row.private_id};
+  let method: string;
+  if (m.text !== undefined) {method = 'editMessageText'; params.text = m.text; if (m.entities) params.entities = m.entities;}
+  else {
+    const inputMedia = media(m);
+    if (inputMedia) {method = 'editMessageMedia'; params.media = inputMedia;}
+    else if (m.caption !== undefined) {method = 'editMessageCaption'; params.caption = m.caption; if (m.caption_entities) params.caption_entities = m.caption_entities;}
+    else {await audit(e, 'edit_unsupported', {message: row.id}); await notify(e, `edit:${row.id}:${updateId}:unsupported`, row.thread_id, '该消息类型不支持编辑同步；保留已有副本。'); return;}
+  }
+  const outcome = await call(e, `edit:${row.id}:${updateId}`, method, params, {messageIds: [row.id], threadVersion: {userId: u.tgid, version: u.binding_version, threadId: row.thread_id ?? undefined}});
+  if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
+  if (outcome.status === 'failed' && /message is not modified/i.test(outcome.reason)) return;
+  if (outcome.status !== 'success') {
+    await audit(e, `edit_${outcome.status}`, {message: row.id, code: outcome.code});
+    await notify(e, `edit:${row.id}:${updateId}:notice`, row.thread_id, outcome.status === 'unknown' ? '发生未知情况：编辑同步结果未知，不会重发原消息。' : `编辑未同步：${outcome.reason}`);
+  }
+}
+
+async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string) {
+  const template = await setting(e, command === 'start' ? 'start_text' : 'help_text', command === 'start' ? '你好，{name}。请直接发送消息，管理员会人工回复。' : '请直接发送文字或媒体与管理员联系。');
+  const name = [m.from?.first_name, m.from?.last_name].filter(Boolean).join(' ') || row.user_id;
+  const text = template.replace(/\{(?:name|first_name|last_name|username|tgid)\}/g, token => ({'{name}': name, '{first_name}': m.from?.first_name ?? '', '{last_name}': m.from?.last_name ?? '', '{username}': m.from?.username ? `@${m.from.username}` : '未设置', '{tgid}': row.user_id}[token] ?? token));
+  // Reserve the reply before sending. A concurrent clear captures this row, or
+  // attaches it to the already captured command's batch before any API call.
+  await e.DB.batch([
+    stmt(e, "INSERT OR IGNORE INTO messages(user_id,direction,source_chat,source_id,business,received_at,payload,epoch) VALUES(?,?,?, ?,0,?,?,?)", row.user_id, 'system', row.user_id, -row.id, now(), JSON.stringify({text}), row.epoch),
+    stmt(e, 'UPDATE messages SET tombstone=(SELECT tombstone FROM messages WHERE id=?) WHERE source_chat=? AND source_id=?', row.id, row.user_id, -row.id),
+    stmt(e, 'INSERT OR IGNORE INTO deletion_items(batch_id,message_id) SELECT d.batch_id,m.id FROM deletion_items d JOIN messages m ON m.source_chat=? AND m.source_id=? WHERE d.message_id=?', row.user_id, -row.id, row.id),
+  ]);
+  const reply = await one<MessageRow>(e, 'SELECT * FROM messages WHERE source_chat=? AND source_id=?', row.user_id, -row.id);
+  if (!reply || reply.tombstone) return;
+  const outcome = await call(e, `fixed:${row.id}`, 'sendMessage', {chat_id: row.user_id, text}, {messageIds: [row.id, reply.id]});
+  if (outcome.status === 'success') {
+    const id = knownMessageId(outcome.result);
+    if (id) await run(e, "UPDATE messages SET private_id=?,delivery='success' WHERE id=?", id, reply.id);
+    else {await run(e, "UPDATE messages SET delivery='unknown' WHERE id=?", reply.id); await audit(e, 'fixed_reply_unknown', {message: row.id});}
+  } else {await run(e, 'UPDATE messages SET delivery=? WHERE id=?', outcome.status, reply.id); await audit(e, `fixed_reply_${outcome.status}`, {message: row.id, code: outcome.code});}
+  await run(e, "UPDATE messages SET business=0,delivery='ignored' WHERE id=?", row.id);
+}
+
+/** Handles only persisted business messages. Administrative commands are routed first. */
+export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: boolean): Promise<void> {
+  const privateChat = m.chat.type === 'private' && String(m.chat.id) === String(m.from?.id) && !m.from?.is_bot;
+  if (!privateChat && !authorised(e, m)) return;
+  let row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE source_chat=? AND source_id=?', String(m.chat.id), m.message_id);
+  let u: UserRow | null = privateChat ? await ensureUser(e, String(m.chat.id), m.from, row?.received_at ?? job.created_at) : row ? await user(e, row.user_id) : null;
+  if (!u) return;
+  if (privateChat && u.blocked) {
+    if (row && !edited && row.delivery === 'pending') await run(e, "UPDATE messages SET delivery='blocked' WHERE id=?", row.id);
+    return;
+  }
+  if (edited) {await edit(e, job, row, m, u); return;}
+  if (!row || row.tombstone || row.deletion !== 'none') return;
+  if (!privateChat && (!u.thread_id || u.thread_id !== m.message_thread_id || row.thread_id !== u.thread_id)) {
+    await run(e, "UPDATE messages SET delivery='suppressed' WHERE id=? AND delivery='pending'", row.id);
+    await notify(e, `old-thread:${row.id}`, m.message_thread_id ?? null, '此话题已不是当前绑定，消息未转发。请在当前有效用户话题发送。');
+    return;
+  }
+  const command = m.text?.match(/^\/(start|help)(?:@[A-Za-z0-9_]+)?(?:\s|$)/)?.[1];
+  if (privateChat && command) {await fixedReply(e, row, m, command); return;}
+  if (m.text?.startsWith('/')) {await run(e, "UPDATE messages SET delivery='ignored',business=0 WHERE id=?", row.id); return;}
+  if (!(m.text || m.photo || m.video || m.audio || m.voice || m.document || m.sticker || m.animation)) {
+    await run(e, "UPDATE messages SET delivery='ignored',business=0 WHERE id=?", row.id);
+    await audit(e, 'unsupported_message', {message: row.id});
+    return;
+  }
+  if (privateChat) {
+    u = await ensureThread(e, job, u.tgid);
+    if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id}); return;}
+    await refreshCard(e, job, u.tgid);
+  }
+  row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
+  if (!row || row.tombstone || row.deletion !== 'none') return;
+  if (m.media_group_id) {await album(e, job, row, m, u); return;}
+  if (row.delivery === 'pending') await copyOne(e, row, m, u);
+  else if (row.delivery === 'success' && row.direction === 'out') await reaction(e, `sent-reaction:${row.id}`, row.thread_id, row.source_id, '👍');
+}
+
+async function recoverPrivateTarget(e: Env, row: MessageRow): Promise<void> {
+  if (row.private_id || row.direction === 'in') return;
+  let key = row.direction === 'system' ? `fixed:${-row.source_id}` : `send:${row.id}`;
+  let method = row.direction === 'system' ? 'sendMessage' : 'copyMessage';
+  let memberIds: number[] | null = null;
+  if (row.media_group) {
+    const batch = await one<{batch_key: string; members: string}>(e, 'SELECT batch_key,members FROM media_batches WHERE EXISTS(SELECT 1 FROM json_each(members) WHERE value=?) ORDER BY rowid DESC LIMIT 1', row.id);
+    if (batch) {key = batch.batch_key; method = 'sendMediaGroup'; memberIds = JSON.parse(batch.members) as number[];}
+  }
+  if (method === 'copyMessage' && await one(e, 'SELECT op_key FROM operations WHERE op_key=?', `${e.RECOVERY_EPOCH}:${key}:without-reply`)) key += ':without-reply';
+  if (!await one(e, 'SELECT op_key FROM operations WHERE op_key=?', `${e.RECOVERY_EPOCH}:${key}`)) return;
+  // The row is tombstoned before this call. Existing DO/D1 journal results can
+  // be read, while the guard forbids issuing any new Telegram content request.
+  const outcome = await call(e, key, method, {}, {messageIds: [row.id]});
+  let id: number | null = null;
+  if (outcome.status === 'success') {
+    if (memberIds) {
+      const results = Array.isArray(outcome.result) ? outcome.result.map(knownMessageId) : [];
+      if (results.length === memberIds.length && results.every(x => x !== null)) id = results[memberIds.indexOf(row.id)] ?? null;
+    } else id = knownMessageId(outcome.result);
+  }
+  if (id !== null) {row.private_id = id; row.delivery = 'success'; await run(e, "UPDATE messages SET private_id=?,delivery='success' WHERE id=?", id, row.id);}
+  else if (outcome.status === 'unknown' || outcome.status === 'success') {row.delivery = 'unknown'; await run(e, "UPDATE messages SET delivery='unknown' WHERE id=?", row.id);}
+}
+
+async function deleteRow(e: Env, row: MessageRow, opKey: string): Promise<string> {
+  if (row.deletion === 'deleted' || row.deletion === 'unknown') return row.deletion;
+  await run(e, 'UPDATE messages SET tombstone=1 WHERE id=?', row.id);
+  await recoverPrivateTarget(e, row);
+  if (!row.private_id) {
+    const result = row.delivery === 'unknown' || row.delivery === 'success' ? 'unknown' : 'unavailable';
+    await run(e, 'UPDATE messages SET deletion=? WHERE id=?', result, row.id);
+    return result;
+  }
+  const outcome = await call(e, opKey, 'deleteMessage', {chat_id: row.user_id, message_id: row.private_id});
+  const result = outcome.status === 'success' && outcome.result === true ? 'deleted' : outcome.status === 'unknown' || outcome.status === 'success' ? 'unknown' : /can't be deleted|cannot be deleted|message to delete not found|not enough rights/i.test(outcome.reason) ? 'unavailable' : 'failed';
+  await run(e, 'UPDATE messages SET deletion=? WHERE id=?', result, row.id);
+  if (result !== 'deleted') await audit(e, 'deletion_exception', {message: row.id, result, ...(outcome.status !== 'success' ? {code: outcome.code, reason: outcome.reason} : {})});
+  return result;
+}
+
+export async function deleteSingle(e: Env, job: Job, m: TGMessage, u: UserRow): Promise<void> {
+  if (!authorised(e, m) || m.message_thread_id !== u.thread_id || !m.reply_to_message) return;
+  const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND admin_id=? ORDER BY id DESC LIMIT 1', u.tgid, m.reply_to_message.message_id);
+  if (!row) {await notify(e, `sc:${job.id}:missing`, u.thread_id, '无法删除：新系统没有这条消息的用户端映射。'); return;}
+  const result = await deleteRow(e, row, `delete:${row.id}:${job.id}`);
+  if (row.media_group) await albumStatus(e, row, true, `delete:${job.id}`);
+  else if (result === 'deleted' && row.admin_id) await reaction(e, `deleted-reaction:${row.id}`, row.thread_id, row.admin_id, '👎');
+  if (result !== 'deleted') await notify(e, `sc:${job.id}:result`, u.thread_id, result === 'unknown' ? '发生未知情况：删除结果未知，未标记为成功。' : result === 'unavailable' ? '未删除：消息不存在、超过限制、权限不足或没有已确认的私聊目标。' : '未删除：Telegram 明确拒绝，请查看异常记录。');
+}
+
+/** Only an ingress-captured, tombstoned snapshot may be cleared. */
+export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: string): Promise<void> {
+  if (!batchId) return;
+  const batch = await one<{user_id: string; state: string}>(e, 'SELECT user_id,state FROM deletion_batches WHERE id=?', batchId);
+  if (!batch || batch.user_id !== u.tgid || batch.state === 'done') return;
+  const items = await all<{message_id: number}>(e, "SELECT message_id FROM deletion_items WHERE batch_id=? AND result='pending' ORDER BY message_id LIMIT ?", batchId, CLEAR_LIMIT);
+  for (const item of items) {
+    const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=? AND user_id=?', item.message_id, u.tgid);
+    const result = row ? await deleteRow(e, row, `clear:${batchId}:${row.id}`) : 'unavailable';
+    await run(e, 'UPDATE deletion_items SET result=? WHERE batch_id=? AND message_id=?', result, batchId, item.message_id);
+    if (row?.admin_id && !row.media_group && result === 'deleted') await reaction(e, `deleted-reaction:${row.id}`, row.thread_id, row.admin_id, '👎');
+  }
+  const pending = await one<{n: number}>(e, "SELECT COUNT(*) n FROM deletion_items WHERE batch_id=? AND result='pending'", batchId);
+  if (pending?.n) {
+    await enqueue(e, u.tgid, 'clear', {batchId}, `clear:${batchId}:after:${items.at(-1)?.message_id ?? job.id}`);
+    return;
+  }
+  // Recalculate all affected albums once the batch has a final result, including
+  // albums that crossed the bounded continuation between jobs.
+  const albumRows = await all<MessageRow>(e, 'SELECT m.* FROM messages m JOIN deletion_items d ON d.message_id=m.id WHERE d.batch_id=? AND m.media_group IS NOT NULL GROUP BY m.source_chat,m.media_group', batchId);
+  for (const row of albumRows) await albumStatus(e, row, true, `clear:${batchId}`);
+  const counts = await all<{result: string; n: number}>(e, 'SELECT result,COUNT(*) n FROM deletion_items WHERE batch_id=? GROUP BY result', batchId);
+  const count = (result: string) => counts.find(r => r.result === result)?.n ?? 0;
+  await notify(e, `clear:${batchId}:summary`, u.thread_id, `清空已处理：确认删除 ${count('deleted')}；明确失败 ${count('failed')}；不可删除/未发送 ${count('unavailable')}；结果未知 ${count('unknown')}。确认后新消息不在本次范围内。旧系统未记录历史无法追溯，数量未知。管理员历史和话题保留。`);
+  await run(e, "UPDATE deletion_batches SET state='done' WHERE id=?", batchId);
+}
