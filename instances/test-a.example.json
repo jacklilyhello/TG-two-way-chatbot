@@ -1,0 +1,12 @@
+{
+  "instance_id": "test-a",
+  "expected_bot_id": "123456789",
+  "admin_chat_id": "-1001234567890",
+  "admin_ids": ["123456789"],
+  "hostname": "two-way-test-a.lilyya.top",
+  "worker_name": "tg-two-way-test-a",
+  "d1_name": "tg-two-way-test-a-db",
+  "queue_name": "tg-two-way-test-a-jobs",
+  "dlq_name": "tg-two-way-test-a-dlq",
+  "recovery_epoch": "initial"
+}

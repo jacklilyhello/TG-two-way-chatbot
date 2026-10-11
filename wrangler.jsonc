@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tg-two-way-local",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "vars": {"INSTANCE_ID":"local-test","EXPECTED_BOT_ID":"123456","ADMIN_CHAT_ID":"-1001234567890","ADMIN_IDS":"10001","VERSION":"local","RECOVERY_EPOCH":"initial"},
+  "d1_databases": [{"binding":"DB","database_name":"tg-two-way-local-db","database_id":"00000000-0000-0000-0000-000000000000","migrations_dir":"migrations"}],
+  "queues": {"producers":[{"binding":"JOBS","queue":"tg-two-way-local-jobs"}],"consumers":[{"queue":"tg-two-way-local-jobs","max_batch_size":10,"max_batch_timeout":1,"max_retries":5,"dead_letter_queue":"tg-two-way-local-dlq"}]},
+  "durable_objects":{"bindings":[{"name":"CONVERSATIONS","class_name":"ConversationCoordinator"},{"name":"BOT","class_name":"BotCoordinator"}]},
+  "migrations":[{"tag":"v1","new_sqlite_classes":["ConversationCoordinator","BotCoordinator"]}],
+  "triggers":{"crons":["* * * * *"]},
+  "observability":{"enabled":true,"head_sampling_rate":0.1}
+}

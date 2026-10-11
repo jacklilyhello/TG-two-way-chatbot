@@ -1,0 +1,113 @@
+name: Instance operations
+run-name: Instance ${{ inputs.instance }} / ${{ inputs.operation }}
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: Private environment instance alias (for example test-a)
+        required: true
+        type: string
+      release_sha:
+        description: Exact 40-character commit SHA already merged into main
+        required: true
+        type: string
+      operation:
+        description: Single-instance operation; every deployment remains paused until explicit resume
+        required: true
+        default: status
+        type: choice
+        options: [status, deploy, pause, resume, recover, export]
+      provision:
+        description: Create missing resources for a new instance only
+        default: false
+        type: boolean
+      configure_webhook:
+        description: Register Telegram webhook without dropping pending updates
+        default: false
+        type: boolean
+      old_consumer_stopped:
+        description: Old polling/webhook consumer and automatic restarts stopped; outbound requests drained
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: instance-${{ inputs.instance }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release and successful CI
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          INSTANCE_ID: ${{ inputs.instance }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e 'if (!/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA) || !/^[a-z][a-z0-9-]{0,30}$/.test(process.env.INSTANCE_ID)) process.exit(1)'
+          git cat-file -e "$RELEASE_SHA^{commit}"
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&status=success&per_page=100" --jq '.workflow_runs | any(.head_sha == env.RELEASE_SHA and .event == "push" and .head_branch == "main")' | grep -qx true
+  operate:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: tg-two-way-${{ inputs.instance }}
+    env:
+      INSTANCE_ID: ${{ inputs.instance }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      OPERATION: ${{ inputs.operation }}
+      PROVISION: ${{ inputs.provision }}
+      CONFIGURE_WEBHOOK: ${{ inputs.configure_webhook }}
+      OLD_CONSUMER_STOPPED: ${{ inputs.old_consumer_stopped }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Check instance boundaries
+        env:
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+        run: node scripts/check-instances.mjs
+      - name: Execute scoped operation
+        env:
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+        run: node scripts/deploy-instance.mjs
+      - name: Encrypt private export
+        if: inputs.operation == 'export'
+        env:
+          BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age
+          age -r "$BACKUP_AGE_RECIPIENT" -o .local/database.sql.age .local/database.sql
+          rm -f .local/database.sql
+      - name: Save encrypted backup only
+        if: inputs.operation == 'export'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: encrypted-backup-${{ inputs.instance }}-${{ github.run_id }}
+          path: .local/database.sql.age
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove private temporary files
+        if: always()
+        run: rm -rf .local
