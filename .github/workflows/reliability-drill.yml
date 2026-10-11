@@ -1,0 +1,109 @@
+name: Isolated cloud reliability drill
+run-name: Reliability drill ${{ inputs.instance }}
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: Authorized test alias only; no production instance accepted
+        required: true
+        type: choice
+        options: [test-a, test-b]
+      release_sha:
+        description: Exact main SHA with successful main CI
+        required: true
+        type: string
+      operation:
+        description: Run isolated faults or remove the route of a previously interrupted drill
+        required: true
+        default: run
+        type: choice
+        options: [run, remove-route]
+      cleanup_run:
+        description: Only for remove-route; exact previous run identity such as 123456789-1
+        required: false
+        default: ''
+        type: string
+      confirm_synthetic_resources:
+        description: Create isolated synthetic resources; use internal API stub, never real Telegram
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: instance-${{ inputs.instance }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    if: github.ref == 'refs/heads/main' && inputs.confirm_synthetic_resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify selected test alias and immutable release
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          INSTANCE_ID: ${{ inputs.instance }}
+          DRILL_OPERATION: ${{ inputs.operation }}
+          DRILL_CLEANUP_RUN: ${{ inputs.cleanup_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e 'if (!/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA) || !["test-a","test-b"].includes(process.env.INSTANCE_ID) || !["run","remove-route"].includes(process.env.DRILL_OPERATION) || (process.env.DRILL_OPERATION === "remove-route" && !/^\d{1,20}-\d{1,3}$/.test(process.env.DRILL_CLEANUP_RUN))) process.exit(1)'
+          git cat-file -e "$RELEASE_SHA^{commit}"
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&status=success&per_page=100" --jq '.workflow_runs | any(.head_sha == env.RELEASE_SHA and .event == "push" and .head_branch == "main")' | grep -qx true
+  drill:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: tg-two-way-${{ inputs.instance }}
+    env:
+      INSTANCE_ID: ${{ inputs.instance }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Validate isolated drill code before platform writes
+        run: |
+          node --test scripts/reliability-drill.node-test.mjs
+          npx tsc -p scripts/reliability-drill/tsconfig.json
+          npx vitest run --config scripts/reliability-drill/vitest.config.ts
+      - name: Run controlled faults using independent resources only
+        id: faults
+        if: inputs.operation == 'run'
+        env:
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node scripts/reliability-drill.mjs
+      - name: Ensure the exact temporary route is removed after failure or cancellation
+        if: always() && (inputs.operation == 'remove-route' || steps.faults.outcome != 'skipped')
+        env:
+          DRILL_CLEANUP_RUN: ${{ inputs.operation == 'remove-route' && inputs.cleanup_run || '' }}
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node scripts/reliability-drill.mjs --remove-route
+      - name: Save sanitized synthetic evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reliability-drill-${{ inputs.instance }}-${{ github.run_id }}
+          path: .local/reliability-result.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove private runner files
+        if: always()
+        run: rm -f .local/wrangler.reliability.json .local/reliability-result.json
