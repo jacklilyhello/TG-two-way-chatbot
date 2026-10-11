@@ -5,6 +5,7 @@ import {ensureThread, ensureUser, scheduleCard} from './admin';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {syncReceipt} from './receipts';
 import {internalForward, admittedBindingMatches, albumMemberBindingMatches} from './security';
+import {bindRetryNotice, deliveryRetryButton, latestDelivery, type DeliveryAttempt} from './delivery-retry';
 export {handleReaction} from './receipts';
 
 const CLEAR_LIMIT = 20;
@@ -37,33 +38,38 @@ async function recordOutcome(e: Env, row: MessageRow, outcome: Outcome, thread: 
 async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome) {
   if (outcome.status === 'success') return;
   if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
-  if (!await one(e, "SELECT id FROM audit_logs WHERE event=? AND json_extract(detail,'$.message')=? LIMIT 1",`delivery_${outcome.status}`,row.id)) await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason});
+  const delivery = await latestDelivery(e,row);
+  const opKey = `${e.RECOVERY_EPOCH}:${delivery.key}`;
+  if (!await one(e, "SELECT id FROM audit_logs WHERE event=? AND json_extract(detail,'$.message')=? AND (json_extract(detail,'$.opKey')=? OR (?=0 AND json_extract(detail,'$.opKey') IS NULL)) LIMIT 1",`delivery_${outcome.status}`,row.id,opKey,delivery.attempt?.attempt??0)) await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason,opKey});
   if (row.direction !== 'out') return;
   const text = outcome.status === 'unknown' ? '发生未知情况：投递结果未知，内容不会自动重发。' : /bot was blocked by the user/i.test(outcome.reason) ? '对方已拉黑机器人' : `未送达，请重试。${outcome.reason ? `原因：${outcome.reason}` : ''}`;
-  await enqueue(e, `notice:${row.id}`, 'delivery-notice', {rowId:row.id,status:outcome.status,text}, `delivery-notice:${row.id}`);
+  const noticeKey = `delivery-notice:${row.id}${delivery.attempt?`:attempt:${delivery.attempt.attempt}`:''}`;
+  await enqueue(e, `notice:${row.id}`, 'delivery-notice', {rowId:row.id,status:outcome.status,text,opKey}, noticeKey);
   await wakeWork(e, `notice:${row.id}`);
 }
 
 /** A notification retry must not run the original content job again. */
 export async function handleDeliveryNotice(e: Env, job: Job): Promise<void> {
-  const p = JSON.parse(job.payload) as {rowId:number;status:string;text:string};
+  const p = JSON.parse(job.payload) as {rowId:number;status:string;text:string;opKey?:string};
   const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?',p.rowId);
   if (!row || row.direction !== 'out' || row.epoch !== e.RECOVERY_EPOCH || row.delivery !== p.status || !['failed','unknown'].includes(p.status) || typeof p.text !== 'string') return;
-  const outcome = await notify(e, `delivery-notice:${row.id}`, row.thread_id, p.text);
+  const delivery = await latestDelivery(e,row);
+  if (!p.opKey && delivery.attempt) return;
+  if (p.opKey && p.opKey!==`${e.RECOVERY_EPOCH}:${delivery.key}`) return;
+  const button = p.status==='failed' ? await deliveryRetryButton(e,row) : null;
+  const outcome = await notify(e, job.dedupe, row.thread_id, p.text,button?{reply_markup:button.reply_markup}:{});
+  if (button && outcome.status==='success') await bindRetryNotice(e,button.token,knownMessageId(outcome.result)??0);
   if (outcome.status !== 'success') await audit(e, 'delivery_notice_exception', {message:row.id,status:outcome.status,code:outcome.code});
 }
 
 /** Recover a crash between recording a terminal delivery and queuing its
  * administrator notice. Read the ledger only; no content request is issued. */
 async function restoreDeliveryNotice(e: Env, row: MessageRow) {
-  if (row.direction !== 'out' || !['failed','unknown'].includes(row.delivery) || await one(e,'SELECT id FROM jobs WHERE dedupe=?',`delivery-notice:${row.id}`)) return;
-  let key = `send:${row.id}`;
-  if (row.media_group) {
-    const batch = await one<{batch_key:string}>(e, 'SELECT batch_key FROM media_batches WHERE EXISTS(SELECT 1 FROM json_each(members) WHERE value=?) ORDER BY rowid DESC LIMIT 1',row.id);
-    if (batch) key = batch.batch_key;
-  }
-  if (await one(e,'SELECT op_key FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}:without-reply`)) key += ':without-reply';
-  const ledger = await one<{reason:string|null;code:number|null}>(e,'SELECT reason,code FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`);
+  if (row.direction !== 'out' || !['failed','unknown'].includes(row.delivery)) return;
+  const delivery = await latestDelivery(e,row);
+  if (await one(e,'SELECT id FROM jobs WHERE dedupe=?',`delivery-notice:${row.id}${delivery.attempt?`:attempt:${delivery.attempt.attempt}`:''}`)) return;
+  const ledger = await one<{phase:string;reason:string|null;code:number|null}>(e,'SELECT phase,reason,code FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${delivery.key}`);
+  if (delivery.attempt && ledger?.phase!==row.delivery) return;
   await deliveryNotice(e,row,{status:row.delivery as 'failed'|'unknown',reason:ledger?.reason??'请查看持久操作记录',code:ledger?.code??undefined});
 }
 
@@ -80,7 +86,7 @@ async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<P
   return {reply_parameters: {message_id: targetId, allow_sending_without_reply: true}};
 }
 
-async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow) {
+async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?:DeliveryAttempt) {
   const current = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
   if (!current || current.tombstone || current.deletion !== 'none') return;
   const chatId = row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid;
@@ -91,20 +97,48 @@ async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow) {
   const params: Params = {chat_id: chatId, from_chat_id: row.source_chat, message_id: row.source_id};
   if (row.direction === 'in') params.message_thread_id = targetThread;
   Object.assign(params, await replyParameters(e, {...row, thread_id: targetThread}, m));
-  const guard = {messageIds: [row.id], threadVersion: {userId: u.tgid, version: u.binding_version, threadId: targetThread ?? undefined}};
-  let outcome = await call(e, `send:${row.id}`, 'copyMessage', params, guard);
+  const guard = {messageIds: [row.id], threadVersion: {userId: u.tgid, version: retry?.binding_version??u.binding_version, threadId: targetThread ?? undefined},...(retry?{deliveryRetry:{messageId:row.id,attempt:retry.attempt,actorId:retry.actor_id,userId:retry.user_id,threadId:retry.thread_id,bindingVersion:retry.binding_version,priorOpKey:retry.prior_op_key}}:{})};
+  const baseKey = retry?.op_key??`send:${row.id}`;
+  // A previously issued no-reply fallback remains the authoritative attempt
+  // even if the quoted target disappeared before this job resumed.
+  const fallback = await one(e,'SELECT op_key FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${baseKey}:without-reply`);
+  const sendKey = fallback?`${baseKey}:without-reply`:baseKey;
+  if (fallback) delete params.reply_parameters;
+  let outcome = await call(e, sendKey, 'copyMessage', params, guard);
   // Reply targets can disappear after the mapping check. Telegram explicitly rejected
   // this request, so a single fallback without a reply cannot duplicate delivery.
   if (outcome.status === 'failed' && /reply.*(?:not found|deleted)|message to be replied not found/i.test(outcome.reason) && params.reply_parameters) {
     delete params.reply_parameters;
     await audit(e, 'reply_fallback', {message: row.id, reason: 'Telegram 拒绝引用目标'});
-    outcome = await call(e, `send:${row.id}:without-reply`, 'copyMessage', params, guard);
+    outcome = await call(e, `${baseKey}:without-reply`, 'copyMessage', params, guard);
   }
   const id = outcome.status === 'success' ? knownMessageId(outcome.result) : null;
   if (outcome.status === 'success' && id === null) outcome = {status: 'unknown', reason: 'Telegram 返回缺少有效消息 ID'};
   await recordOutcome(e, row, outcome, targetThread, id);
+  if (retry) await run(e,'UPDATE delivery_attempts SET state=? WHERE message_id=? AND attempt=?',outcome.status==='failed'&&outcome.reason==='cancelled_by_state'?'suppressed':outcome.status,row.id,retry.attempt);
   if (row.direction === 'out') await syncReceipt(e, row.id);
   await deliveryNotice(e, {...row, thread_id: targetThread}, outcome);
+}
+
+/** The new attempt runs in the same user's ordered business lane. A stale
+ * reservation can recover its journal, but final guards forbid a new send. */
+export async function handleDeliveryRetry(e:Env,job:Job):Promise<void> {
+  const p = JSON.parse(job.payload) as {rowId:number;attempt:number};
+  const attempt = await one<DeliveryAttempt>(e,'SELECT * FROM delivery_attempts WHERE message_id=? AND attempt=? AND epoch=?',p.rowId,p.attempt,e.RECOVERY_EPOCH);
+  const row = attempt ? await one<MessageRow>(e,'SELECT * FROM messages WHERE id=?',attempt.message_id) : null;
+  if (!attempt || !row || job.epoch!==e.RECOVERY_EPOCH || job.user_key!==attempt.user_id || row.user_id!==attempt.user_id || row.direction!=='out' || row.media_group || row.epoch!==e.RECOVERY_EPOCH) return;
+  if ((await latestDelivery(e,row)).attempt?.attempt!==attempt.attempt) return;
+  if (row.tombstone || row.deletion!=='none') {
+    await recoverPrivateTarget(e,row);
+    const delivery=await latestDelivery(e,row);
+    const ledger=await one<{phase:string;reason:string|null}>(e,'SELECT phase,reason FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${delivery.key}`);
+    const state=ledger?.phase==='success'?'success':ledger?.phase==='unknown'?'unknown':ledger?.phase==='failed'&&ledger.reason!=='cancelled_by_state'?'failed':'suppressed';
+    await run(e,'UPDATE delivery_attempts SET state=? WHERE message_id=? AND attempt=?',state,row.id,attempt.attempt);
+    return;
+  }
+  const u = await user(e,row.user_id);
+  if (!u) return;
+  await copyOne(e,row,JSON.parse(row.payload) as TGMessage,u,attempt);
 }
 
 async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: string) {
@@ -271,14 +305,7 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
 
 async function recoverPrivateTarget(e: Env, row: MessageRow): Promise<void> {
   if (row.private_id || row.direction === 'in') return;
-  let key = row.direction === 'system' ? `fixed:${-row.source_id}` : `send:${row.id}`;
-  let method = row.direction === 'system' ? 'sendMessage' : 'copyMessage';
-  let memberIds: number[] | null = null;
-  if (row.media_group) {
-    const batch = await one<{batch_key: string; members: string}>(e, 'SELECT batch_key,members FROM media_batches WHERE EXISTS(SELECT 1 FROM json_each(members) WHERE value=?) ORDER BY rowid DESC LIMIT 1', row.id);
-    if (batch) {key = batch.batch_key; method = 'sendMediaGroup'; memberIds = JSON.parse(batch.members) as number[];}
-  }
-  if (method === 'copyMessage' && await one(e, 'SELECT op_key FROM operations WHERE op_key=?', `${e.RECOVERY_EPOCH}:${key}:without-reply`)) key += ':without-reply';
+  const {key,method,members:memberIds} = await latestDelivery(e,row);
   if (!await one(e, 'SELECT op_key FROM operations WHERE op_key=?', `${e.RECOVERY_EPOCH}:${key}`)) return;
   // The row is tombstoned before this call. Existing DO/D1 journal results can
   // be read, while the guard forbids issuing any new Telegram content request.

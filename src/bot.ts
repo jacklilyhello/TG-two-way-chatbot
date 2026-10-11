@@ -1,6 +1,7 @@
 import type {Env,Params} from './types';
 import type {Outcome,IssueGuard} from './operations';
-import {receiptGuardValid} from './receipts';
+import {dueReceiptCleanup,receiptGuardValid} from './receipts';
+import {deliveryRetryGuardValid} from './delivery-retry';
 const allowed = new Set(['getMe','getChat','getChatMember','getUserProfilePhotos','createForumTopic','editForumTopic','sendMessage','sendPhoto','sendMediaGroup','copyMessage','editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','pinChatMessage','unpinChatMessage','setMessageReaction','deleteMessage','answerCallbackQuery','setMyCommands']);
 interface RequestBody {key:string;method:string;params:Params;guard?:IssueGuard}
 interface Journal {phase:'issued'|'done';outcome?:Outcome;apiMs?:number}
@@ -57,12 +58,13 @@ export class BotCoordinator {
   if(guard) {
    const hidden=guard.messageIds?.length?await this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds).first():null;
    const binding=guard.threadVersion?await this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId).first<{binding_version:number;thread_id:number}>():null;
-   if(hidden||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))) {
+   if(hidden||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
     const outcome:Outcome={status:'failed',reason:'cancelled_by_state',code:409};
     await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
    }
   }
   if(this.env.PAUSED==='true'||await this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'").first())return Response.json({due:time+60000},{status:429});
+  if(reaction && guard?.receipt && !guard.receipt.clear && guard.receipt.emoji==='👍' && await dueReceiptCleanup(this.env,time))return Response.json({due:time+100},{status:429});
   if(!exempt) {
    const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;
    await this.state.storage.put({'rate:global':time+40*messageCount,...(chat?{[chatRateKey]:time+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})});
