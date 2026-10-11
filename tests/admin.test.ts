@@ -23,6 +23,12 @@ import {ensureUser,ensureThread,handleAdmin,profileLinks,rangeStart,refreshCard,
 const e={...env,BOT:bot} as unknown as Env;
 const job=(id:number,user_key='20001'):Job=>({id,dedupe:`test:${id}`,user_key,kind:'update',payload:'{}',state:'running',due_at:0,attempts:0,epoch:e.RECOVERY_EPOCH,created_at:1});
 const message=(id:number,text:string,thread?:number):TGMessage=>({message_id:id,date:1,chat:{id:Number(e.ADMIN_CHAT_ID),type:'supergroup',is_forum:true},from:{id:10001},text,...(thread?{message_thread_id:thread,is_topic_message:true}:{})});
+async function settingCommand(id:number,text:string,thread?:number) {
+ const update={update_id:id,message:message(id,text,thread)};
+ await accept(e,update);
+ const saved=(await one<Job>(e,'SELECT * FROM jobs WHERE dedupe=?',`u:${id}`))!;
+ return handleAdmin(e,saved,update);
+}
 const callback=(id:number,token:string,messageId:number,thread:number,actor=10001):TGUpdate=>({update_id:id,callback_query:{id:`callback:${id}`,from:{id:actor},data:`a:${token}`,message:{...message(messageId,'',thread),from:{id:Number(e.EXPECTED_BOT_ID),is_bot:true}}}});
 async function registered(id='20001',thread=40,version=1,card=500) {
  await run(e,'INSERT INTO users(tgid,first_contact,thread_id,binding_version,card_id) VALUES(?,1,?,?,?)',id,thread,version,card);
@@ -238,22 +244,22 @@ describe('management authorization and clear boundaries',()=>{
  });
  it('requires General for settings and rejects reserved or occupied log topics',async()=>{
   await registered();
-  await handleAdmin(e,job(34),{update_id:34,message:message(34,'/mb timezone Europe/London',40)});
+  await settingCommand(34,'/mb timezone Europe/London',40);
   expect(await one(e,"SELECT value FROM settings WHERE key='timezone'")).toBeNull();
-  await handleAdmin(e,job(35),{update_id:35,message:message(35,'/mb logtopic 40')});
+  await settingCommand(35,'/mb logtopic 40');
   expect(await one(e,"SELECT value FROM settings WHERE key='log_thread_id'")).toBeNull();
-  await handleAdmin(e,job(36),{update_id:36,message:message(36,'/mb timezone Bad/Timezone')});
+  await settingCommand(36,'/mb timezone Bad/Timezone');
   expect(await one(e,"SELECT value FROM settings WHERE key='timezone'")).toBeNull();
  });
  it('rejects fixed templates whose supported variables could expand beyond Telegram limits',async()=>{
   const tooLarge='{name}'.repeat(16);
-  await handleAdmin(e,job(63),{update_id:63,message:message(63,'/mb start '+tooLarge)});
+  await settingCommand(63,'/mb start '+tooLarge);
   expect(await one(e,"SELECT value FROM settings WHERE key='start_text'")).toBeNull();
   expect(api.requests.findLast(r=>r.method==='sendMessage')!.params.text).toContain('4096');
   const safe='{name}'.repeat(15);
-  await handleAdmin(e,job(64),{update_id:64,message:message(64,'/mb start '+safe)});
+  await settingCommand(64,'/mb start '+safe);
   expect(await one(e,"SELECT value FROM settings WHERE key='start_text'")).toEqual({value:safe});
-  await handleAdmin(e,job(65),{update_id:65,message:message(65,'/mb help '+'{first_name}'.repeat(33))});
+  await settingCommand(65,'/mb help '+'{first_name}'.repeat(33));
   expect(await one(e,"SELECT value FROM settings WHERE key='help_text'")).toBeNull();
  });
 });
