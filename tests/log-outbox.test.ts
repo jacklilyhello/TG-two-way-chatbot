@@ -198,7 +198,11 @@ describe('durable event-driven log outbox',()=>{
   expect(JSON.parse(job.payload).auditIds).toHaveLength(1);
   await audit(quiet(),'synthetic log after 429');
   expect(await logJobs()).toHaveLength(1);
-  await run(base,'UPDATE jobs SET due_at=0 WHERE id=?',job.id);await clearRate();
+  // Let both Telegram's retry_after and the shared group-send pace expire.
+  // Clearing only an older pacing key must never bypass the durable backoff.
+  const bot=base.BOT.get(base.BOT.idFromName(base.INSTANCE_ID));
+  const retryAt=await runInDurableObject(bot,async(_instance,state)=>Math.max(job.due_at,await state.storage.get<number>('rate:backoff')??0,await state.storage.get<number>(`rate:${base.ADMIN_CHAT_ID}`)??0));
+  await new Promise(resolve=>setTimeout(resolve,Math.max(0,retryAt-Date.now())+10));
   await evictDurableObject(system());await wake();
   expect(bodies).toHaveLength(2);
   expect(bodies[1]).toEqual(bodies[0]);

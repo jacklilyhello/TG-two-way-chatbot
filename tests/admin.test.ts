@@ -1,7 +1,7 @@
 import {env} from 'cloudflare:test';
 import {beforeEach,describe,expect,it} from 'vitest';
 import type {Env,Job,Params,TGMessage,TGUpdate} from '../src/types';
-import {all,one,run,user} from '../src/db';
+import {all,one,run,user,setSetting} from '../src/db';
 import {accept} from '../src/ingress';
 
 const api = {requests:[] as {key:string;method:string;params:Record<string,unknown>}[],overrides:new Map<string,unknown>(),sequence:700};
@@ -19,7 +19,8 @@ const bot = {
   return Response.json(api.overrides.get(key) ?? {status:'success',result});
  }})
 };
-import {ensureUser,ensureThread,handleAdmin,profileLinks,rangeStart,refreshCard,statistics,validUserId} from '../src/admin';
+import {ensureUser,ensureThread,handleAdmin,handleCard,scheduleCard,profileLinks,rangeStart,refreshCardNow as refreshCard,statistics,validUserId} from '../src/admin';
+import {RetryLater} from '../src/operations';
 const e={...env,BOT:bot} as unknown as Env;
 const job=(id:number,user_key='20001'):Job=>({id,dedupe:`test:${id}`,user_key,kind:'update',payload:'{}',state:'running',due_at:0,attempts:0,epoch:e.RECOVERY_EPOCH,created_at:1});
 const message=(id:number,text:string,thread?:number):TGMessage=>({message_id:id,date:1,chat:{id:Number(e.ADMIN_CHAT_ID),type:'supergroup',is_forum:true},from:{id:10001},text,...(thread?{message_thread_id:thread,is_topic_message:true}:{})});
@@ -136,7 +137,68 @@ describe('administrator bindings and profile cards',()=>{
   await registered();await refreshCard(e,job(18),'20001');
   api.requests.length=0;
   await refreshCard(e,job(19),'20001');
-  expect(api.requests.map(r=>r.method)).toEqual(['getUserProfilePhotos']);
+  expect(api.requests).toEqual([]);
+ });
+ it('refreshes cached avatars after sixty seconds and lets explicit card repair bypass the cache',async()=>{
+  await registered();await refreshCard(e,job(80),'20001');
+  api.requests.length=0;
+  await refreshCard(e,job(81),'20001',true);
+  expect(api.requests.filter(r=>r.method==='getUserProfilePhotos')).toHaveLength(1);
+  await setSetting(e,'profile_checked:20001',String(Date.now()-60001));
+  api.overrides.set('job:82:avatar:20001',{status:'success',result:{photos:[[{file_id:'new-avatar'}]]}});
+  await refreshCard(e,job(82),'20001');
+  expect((await user(e,'20001'))!.photo_id).toBe('new-avatar');
+  expect(api.requests.find(r=>r.method==='sendPhoto')?.params.photo).toBe('new-avatar');
+ });
+ it('repairs only a confirmed privacy-rejected card using a stable link-free operation',async()=>{
+  await registered();await run(e,"UPDATE users SET card_id=NULL WHERE tgid='20001'");
+  api.overrides.set('card:20001:1:create',{status:'failed',code:400,reason:'Bad Request: BUTTON_USER_PRIVACY_RESTRICTED'});
+  await refreshCard(e,job(83),'20001');
+  const sends=api.requests.filter(r=>r.method==='sendMessage');
+  expect(sends.map(r=>r.key)).toEqual(['card:20001:1:create','card:20001:1:create:without-private-links']);
+  expect(JSON.stringify(sends[0].params.reply_markup)).toContain('tg://user?id=');
+  expect(JSON.stringify(sends[1].params.reply_markup)).not.toContain('tg://user?id=');
+  expect(JSON.stringify(sends[1].params.reply_markup)).toContain('清空此对话');
+  expect((await user(e,'20001'))!.card_id).toBeGreaterThan(0);
+  expect(await one(e,"SELECT phase FROM operations WHERE op_key='initial:card:20001:1:create'")).toEqual({phase:'failed'});
+  api.requests.length=0;await refreshCard(e,job(84),'20001');
+  expect(api.requests).toEqual([]);
+ });
+ it('never retries a card whose external result is unknown',async()=>{
+  await registered();await run(e,"UPDATE users SET card_id=NULL WHERE tgid='20001'");
+  api.overrides.set('card:20001:1:create',{status:'unknown',reason:'response lost'});
+  await refreshCard(e,job(85),'20001');await refreshCard(e,job(86),'20001');
+  expect(api.requests.filter(r=>r.method==='sendMessage').map(r=>r.key)).toEqual(['card:20001:1:create']);
+  expect((await user(e,'20001'))!.card_id).toBeNull();
+ });
+ it('deduplicates background card jobs, yields to business backlog and rejects stale bindings',async()=>{
+  await registered();const u=(await user(e,'20001'))!;
+  const client={...e,JOBS:{send:async()=>{}}} as unknown as Env;
+  await scheduleCard(client,job(87),u);await scheduleCard(client,job(88),u);
+  const jobs=await all<Job>(e,"SELECT * FROM jobs WHERE kind='card'");
+  expect(jobs).toHaveLength(1);expect(jobs[0].user_key).toBe('card:20001');
+  await run(e,"INSERT INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES('business','20001','update','{}','pending',0,'initial',1)");
+  await expect(handleCard(e,jobs[0])).rejects.toBeInstanceOf(RetryLater);
+  expect(api.requests).toEqual([]);
+  await run(e,"UPDATE jobs SET state='done' WHERE dedupe='business'");
+  await run(e,"UPDATE users SET binding_version=2,thread_id=41 WHERE tgid='20001'");
+  await handleCard(e,jobs[0]);expect(api.requests).toEqual([]);
+ });
+ it('creates only the required topic when business delivery defers card maintenance',async()=>{
+  const u=await ensureThread(e,job(89),'20001',false);
+  expect(u.thread_id).toBeGreaterThan(1);expect(u.card_id).toBeNull();
+  expect(api.requests.map(r=>r.method)).toEqual(['getChat','createForumTopic']);
+ });
+ it('preserves a forced follow-up arriving while the card lane is running',async()=>{
+  await registered();const u=(await user(e,'20001'))!;
+  const client={...e,JOBS:{send:async()=>{}}} as unknown as Env;
+  await scheduleCard(client,job(90),u);
+  await run(e,"UPDATE jobs SET state='running' WHERE kind='card'");
+  await scheduleCard(client,job(91),u,true);await scheduleCard(client,job(92),u);
+  const jobs=await all<{state:string;payload:string}>(e,"SELECT state,payload FROM jobs WHERE kind='card' ORDER BY id");
+  expect(jobs).toHaveLength(2);
+  expect(jobs.map(j=>j.state)).toEqual(['running','pending']);
+  expect(JSON.parse(jobs[1].payload).force).toBe(true);
  });
  it('redirects ordinary messages in a retired topic without forwarding or removing history',async()=>{
   await registered('20001',41,2,500);

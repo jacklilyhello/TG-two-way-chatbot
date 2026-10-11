@@ -10,6 +10,16 @@ export async function user(e: Env, id: string) {return one<UserRow>(e,'SELECT * 
 export async function enqueue(e: Env, key: string, kind: string, payload: Params, dedupe: string, delay = 0) {
  await run(e, 'INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES(?,?,?,?,?,?,?,?)', dedupe,key,kind,JSON.stringify(payload),'pending',now()+delay,e.RECOVERY_EPOCH,now());
 }
+/** Arm-only hints never wait for business work and may safely be called by a
+ * coordinator already draining its own tail. D1 remains the source of truth. */
+export async function armWork(e:Env,key:string) {
+ const response=await e.CONVERSATIONS.get(e.CONVERSATIONS.idFromName(key)).fetch('https://conversation/arm',{method:'POST',body:JSON.stringify({key,epoch:e.RECOVERY_EPOCH})});
+ if(!response.ok){await response.body?.cancel();throw new Error('conversation_arm_unavailable');}
+ await response.body?.cancel();
+}
+export async function wakeWork(e:Env,key:string) {
+ await Promise.allSettled([Promise.resolve().then(()=>e.JOBS.send({key})),Promise.resolve().then(()=>armWork(e,key))]);
+}
 export const bootstrapKey = (e: Env) => `bootstrap:${e.RECOVERY_EPOCH}:${e.VERSION}`;
 /** A restored snapshot cannot prove which old logs were sent after its bookmark,
  * even if no operation row exists yet. Seal the existing backlog for manual

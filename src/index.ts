@@ -1,14 +1,16 @@
 import type {Env,TGUpdate} from './types';
 import {validUpdate,accept} from './ingress';
-import {all,run,setting,setSetting,now,audit,enqueue} from './db';
+import {all,run,setting,setSetting,now,audit,enqueue,armWork} from './db';
 import {versionEvent} from './logs';
 import {reconcileIssued} from './operations';
+import {recoverPreparedReceipts} from './receipts';
 export {BotCoordinator} from './bot';
 export {ConversationCoordinator} from './coordinator';
 function secretMatches(a:string,b:string) {if(!a||!b)return false;let diff=a.length^b.length;for(let i=0;i<Math.max(a.length,b.length);i++)diff|=(a.charCodeAt(i)||0)^(b.charCodeAt(i)||0);return diff===0;}
 async function wake(e:Env,key:string) {return e.CONVERSATIONS.get(e.CONVERSATIONS.idFromName(key)).fetch('https://conversation/wake',{method:'POST',body:JSON.stringify({key})});}
 export async function recover(e:Env) {
  await run(e,"UPDATE jobs SET state='quarantined',error='恢复代次不匹配；禁止重放' WHERE epoch!=? AND state NOT IN ('done','quarantined')",e.RECOVERY_EPOCH);
+ await recoverPreparedReceipts(e);
  // A manually recovered binding can unblock originals whose first topic setup failed.
  const stranded=await all<{id:number;user_id:string;payload:string;binding_version:number}>(e,"SELECT m.id,m.user_id,m.payload,u.binding_version FROM messages m JOIN users u ON u.tgid=m.user_id WHERE m.epoch=? AND m.direction='in' AND m.business=1 AND m.delivery='pending' AND m.tombstone=0 AND u.thread_id IS NOT NULL ORDER BY m.id LIMIT 40",e.RECOVERY_EPOCH);
  for(const m of stranded)await enqueue(e,m.user_id,'update',{update:{update_id:0,message:JSON.parse(m.payload)}},`route:${m.id}:${m.binding_version}`);
@@ -17,7 +19,7 @@ export async function recover(e:Env) {
  await versionEvent(e);
 }
 export default {
- async fetch(request:Request,e:Env):Promise<Response> {
+ async fetch(request:Request,e:Env,ctx?:ExecutionContext):Promise<Response> {
   const path=new URL(request.url).pathname;
   if(path==='/health'&&request.method==='GET') {try{await e.DB.prepare('SELECT 1').first();return Response.json({ok:true,version:e.VERSION});}catch{return Response.json({ok:false},{status:503});}}
   if(!['/webhook','/internal/maintenance'].includes(path))return new Response('Not found',{status:404});
@@ -43,12 +45,22 @@ export default {
    }
    if(!validUpdate(body))return new Response('Invalid update',{status:400});
    const key=await accept(e,body as TGUpdate);
+   // The durable commit precedes both independent wake hints. Keep the
+   // Webhook response separate from potentially long conversation draining.
+   ctx?.waitUntil(armWork(e,key).catch(()=>{}));
    try{await e.JOBS.send({key});}catch{/* durable ledger + cron recover queue notification failure */}
    return new Response('ok');
   } catch {return new Response('Temporary unavailable',{status:503});}
  },
  async queue(batch:MessageBatch<{key:string}>,e:Env) {
-  for(const message of batch.messages) {try{const r=await wake(e,message.body.key);if(!r.ok){await r.body?.cancel();throw new Error();}await r.text();message.ack();}catch{message.retry({delaySeconds:10});}}
+  // Queue notifications are hints. A single wake drains a key's durable jobs;
+  // unrelated conversations must not wait behind another key in this batch.
+  const groups=new Map<string,(typeof batch.messages)[number][]>();
+  for(const message of batch.messages){const group=groups.get(message.body.key)??[];group.push(message);groups.set(message.body.key,group);}
+  await Promise.allSettled([...groups].map(async([key,messages])=>{
+   try{const r=await wake(e,key);if(!r.ok){await r.body?.cancel();throw new Error();}await r.text();for(const message of messages)message.ack();}
+   catch{for(const message of messages)message.retry({delaySeconds:10});}
+  }));
  },
  async scheduled(_controller:ScheduledController,e:Env) {await recover(e);}
 } satisfies ExportedHandler<Env, {key:string}>;

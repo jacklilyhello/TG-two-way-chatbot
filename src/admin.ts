@@ -1,8 +1,9 @@
 import type {Env, Job, Params, TGMessage, TGUpdate, TGUser, UserRow} from './types';
-import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user, logOutboxStatements, wakeLogs, logEpochStatements} from './db';
-import {call, notify, type Outcome} from './operations';
+import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user, logOutboxStatements, wakeLogs, wakeWork, logEpochStatements} from './db';
+import {call, notify, RetryLater, type IssueGuard, type Outcome} from './operations';
 import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
+import {admittedBindingMatches,internalForward} from './security';
 
 interface Action {
  token: string; kind: string; user_id: string; actor_id: string; thread_id: number | null;
@@ -78,7 +79,7 @@ async function retryKnownCreationFailures(e: Env, job: Job, u: UserRow) {
  }
 }
 
-export async function ensureThread(e: Env, job: Job, userId: string): Promise<UserRow> {
+export async function ensureThread(e: Env, job: Job, userId: string, prepareCard = true): Promise<UserRow> {
  let u = await ensureUser(e,userId,undefined,job.created_at);
  if (u.thread_id) return u;
  const profile = await call<TGUser>(e,`job:${job.id}:profile:${userId}`,'getChat',{chat_id:userId});
@@ -95,8 +96,32 @@ export async function ensureThread(e: Env, job: Job, userId: string): Promise<Us
   await audit(e,'thread_create_binding_conflict',{user:userId,thread:result.result.message_thread_id});
   return (await user(e,userId))!;
  }
- await refreshCard(e,job,userId);
+ if(prepareCard)await refreshCard(e,job,userId);
  return (await user(e,userId))!;
+}
+
+/** Card repair has its own durable lane. Business messages keep their receive
+ * order and never wait for profile photos, card buttons or pinning. */
+export async function scheduleCard(e:Env,job:Job,u:UserRow,force=false) {
+ if(!u.thread_id)return;
+ const key=`card:${u.tgid}`,time=now();
+ await e.DB.batch([
+  stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT ?,?,'card',?,'pending',?,?,? WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE user_key=? AND kind='card' AND epoch=? AND state IN ('pending','retry') AND json_extract(payload,'$.version')=?)",`${key}:${u.binding_version}:${job.id}`,key,JSON.stringify({userId:u.tgid,version:u.binding_version,threadId:u.thread_id,force}),time,e.RECOVERY_EPOCH,time,key,e.RECOVERY_EPOCH,u.binding_version),
+  ...(force?[stmt(e,"UPDATE jobs SET payload=json_set(payload,'$.force',json('true')) WHERE user_key=? AND kind='card' AND epoch=? AND state IN ('pending','retry') AND json_extract(payload,'$.version')=?",key,e.RECOVERY_EPOCH,u.binding_version)]:[])
+ ]);
+ await wakeWork(e,key);
+}
+
+export async function handleCard(e:Env,job:Job) {
+ const p=JSON.parse(job.payload) as {userId:string;version:number;threadId:number;force?:boolean};
+ const u=await user(e,p.userId);
+ if(!u||u.binding_version!==p.version||u.thread_id!==p.threadId)return;
+ if(await one(e,"SELECT id FROM jobs WHERE user_key=? AND kind IN ('update','clear') AND epoch=? AND state IN ('pending','retry','running') LIMIT 1",u.tgid,e.RECOVERY_EPOCH))throw new RetryLater(now()+1000);
+ await refreshCardNow(e,job,u.tgid,p.force===true);
+}
+
+export async function refreshCard(e:Env,job:Job,userId:string,force=false):Promise<void> {
+ const u=await user(e,userId);if(u?.thread_id)await scheduleCard(e,job,u,force);
 }
 
 function cardText(u: UserRow, timezone: string) {
@@ -109,24 +134,49 @@ async function keyboard(e: Env, job: Job, u: UserRow) {
  const block = await createAction(e,u.blocked ? 'card_unblock' : 'card_block',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
  const clear = await createAction(e,'card_clear',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
  const links = profileLinks(u);
- return {tokens:[block,clear],markup:{inline_keyboard:[
+ const markup={inline_keyboard:[
   [{text:'通用资料',url:links[0]},{text:'苹果资料',url:links[1]},{text:'安卓资料',url:links[2]}],
   [{text:u.blocked ? '解除封禁' : '封禁',callback_data:'a:'+block},{text:'直达对方主页',url:links[0]}],
   [{text:'清空此对话',callback_data:'a:'+clear}]
- ]}};
+ ]};
+ return {tokens:[block,clear],markup:await setting(e,`card_no_id_links:${u.tgid}`)==='1'?withoutPrivateLinks(markup):markup};
+}
+function withoutPrivateLinks(markup:{inline_keyboard:Button[][]}) {
+ return {inline_keyboard:markup.inline_keyboard.map(row=>row.filter(button=>!button.url?.startsWith('tg://user?id='))).filter(row=>row.length)};
+}
+async function cardCall(e:Env,key:string,method:string,params:Params,guard:IssueGuard,u:UserRow):Promise<Outcome<any>> {
+ const result=await call(e,key,method,params,guard);
+ // Telegram explicitly rejected these buttons, so this specific correction
+ // cannot duplicate a delivered card. Unknown sends remain terminal.
+ if(result.status==='failed'&&result.code===400&&/BUTTON_USER_PRIVACY_RESTRICTED/.test(result.reason)&&params.reply_markup) {
+  await setSetting(e,`card_no_id_links:${u.tgid}`,'1');
+  return call(e,`${key}:without-private-links`,method,{...params,reply_markup:withoutPrivateLinks(params.reply_markup as {inline_keyboard:Button[][]})},guard);
+ }
+ return result;
 }
 async function recordProblem(e: Env, event: string, u: UserRow, result: Outcome) {
  if (result.status !== 'success') await audit(e,event,{user:u.tgid,thread:u.thread_id,status:result.status,code:result.code ?? null});
 }
-export async function refreshCard(e: Env, job: Job, userId: string, force = false): Promise<void> {
+/** Only the card coordinator calls this in production. All administrator and
+ * incoming-message paths enqueue work on that same lane. */
+export async function refreshCardNow(e: Env, job: Job, userId: string, force = false): Promise<void> {
  let u = await user(e,userId);
  if (!u?.thread_id) return;
- const photos = await call<{photos:{file_id:string}[][]}>(e,`job:${job.id}:avatar:${userId}`,'getUserProfilePhotos',{user_id:userId,limit:1});
- if (photos.status === 'success') {
-  const photo = photos.result.photos?.[0]?.at(-1)?.file_id ?? null;
-  await run(e,'UPDATE users SET photo_id=? WHERE tgid=?',photo,userId);
-  u = (await user(e,userId))!;
+ const boundVersion=u.binding_version,boundThread=u.thread_id;
+ const guard:IssueGuard={threadVersion:{userId:u.tgid,version:boundVersion,threadId:boundThread}};
+ const photoChecked=Number(await setting(e,`profile_checked:${u.tgid}`,'0'));
+ if(force||!photoChecked||now()-photoChecked>=60000) {
+  const photos = await call<{photos:{file_id:string}[][]}>(e,`job:${job.id}:avatar:${userId}`,'getUserProfilePhotos',{user_id:userId,limit:1});
+  if (photos.status === 'success') {
+   const photo = photos.result.photos?.[0]?.at(-1)?.file_id ?? null;
+   await e.DB.batch([
+    stmt(e,'UPDATE users SET photo_id=? WHERE tgid=?',photo,userId),
+    stmt(e,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',`profile_checked:${u.tgid}`,String(now()))
+   ]);
+  }
  }
+ u = await user(e,userId);
+ if(!u||u.binding_version!==boundVersion||u.thread_id!==boundThread)return;
  const timezone = await setting(e,'timezone','Asia/Singapore');
  const stateKey = `card_state:${u.tgid}:${u.binding_version}`;
  if (!force && u.card_id && await setting(e,stateKey)===cardSignature(u,timezone)) return;
@@ -134,7 +184,7 @@ export async function refreshCard(e: Env, job: Job, userId: string, force = fals
  // Tokens are immutable and bind to the card and binding, so an old keyboard
  // cannot control a later card even if Telegram kept its message in history.
  const controls = await keyboard(e,job,u);
- const reply_markup = controls.markup;
+ let reply_markup = controls.markup;
  const mediaKey = `card_media:${u.tgid}:${u.binding_version}`;
  const existingMedia = await setting(e,mediaKey,'text');
  const base = `card:${u.tgid}:${u.binding_version}`;
@@ -144,8 +194,8 @@ export async function refreshCard(e: Env, job: Job, userId: string, force = fals
  if (!cardId || replace) {
   const creationKey = replace ? `${base}:replace:${cardId}:${u.photo_id ?? 'text'}` : await setting(e,`card_create_key:${u.tgid}:${u.binding_version}`,`${base}:create`);
   const result = u.photo_id
-   ? await call<TGMessage>(e,creationKey,'sendPhoto',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,photo:u.photo_id,caption:text,parse_mode:'HTML',reply_markup})
-   : await notify(e,creationKey,u.thread_id,text,{parse_mode:'HTML',reply_markup});
+   ? await cardCall(e,creationKey,'sendPhoto',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,photo:u.photo_id,caption:text,parse_mode:'HTML',reply_markup},guard,u)
+   : await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text,parse_mode:'HTML',reply_markup},guard,u);
   if (result.status !== 'success' || !Number.isSafeInteger(result.result.message_id) || result.result.message_id <= 0) {
    await recordProblem(e,'card_create_unavailable',u,result);
    return;
@@ -156,25 +206,26 @@ export async function refreshCard(e: Env, job: Job, userId: string, force = fals
    stmt(e,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',mediaKey,u.photo_id ?? 'text')
   ]);
   if (u.card_id && u.card_id !== cardId) {
-   const unpin = await call(e,`${base}:unpin:${u.card_id}`,'unpinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:u.card_id});
+   const unpin = await call(e,`${base}:unpin:${u.card_id}`,'unpinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:u.card_id},guard);
    await recordProblem(e,'card_unpin_failed',u,unpin);
   }
  } else {
   const result = existingMedia !== 'text'
    ? u.photo_id && u.photo_id !== existingMedia
-    ? await call(e,`job:${job.id}:card:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup})
-    : await call(e,`job:${job.id}:card:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup})
-   : await call(e,`job:${job.id}:card:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup});
+    ? await cardCall(e,`job:${job.id}:card:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup},guard,u)
+    : await cardCall(e,`job:${job.id}:card:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup},guard,u)
+   : await cardCall(e,`job:${job.id}:card:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup},guard,u);
   await recordProblem(e,'card_update_failed',u,result);
   updated = result.status==='success';
   if (result.status === 'success' && u.photo_id && existingMedia !== 'text') await setSetting(e,mediaKey,u.photo_id);
  }
  // A recovered create may return an already-created card with another job's
  // keyboard. Establish this generation before retiring older controls.
- const markup = await call(e,`job:${job.id}:card:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup});
+ if(await setting(e,`card_no_id_links:${u.tgid}`)==='1')reply_markup=withoutPrivateLinks(reply_markup);
+ const markup = await cardCall(e,`job:${job.id}:card:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup},guard,u);
  await recordProblem(e,'card_buttons_failed',u,markup);
  if (markup.status==='success') await run(e,"UPDATE callback_actions SET used=-1 WHERE user_id=? AND version=? AND kind LIKE 'card_%' AND used=0 AND token NOT IN (?,?)",u.tgid,u.binding_version,...controls.tokens);
- const pin = await call(e,`job:${job.id}:card:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true});
+ const pin = await call(e,`job:${job.id}:card:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
  await recordProblem(e,'card_pin_failed',u,pin);
  if (updated && markup.status==='success' && pin.status==='success') await setSetting(e,stateKey,cardSignature({...u,card_id:cardId},timezone));
 }
@@ -219,8 +270,15 @@ export async function statistics(e: Env, range: Range, timestamp = now()) {
  const denominator = messages.success+messages.failed;
  return {timezone,start,users,messages,today,anomalies,rate:denominator ? (messages.success/denominator*100).toFixed(1)+'%' : '暂无已确认投递'};
 }
-async function panelButton(e: Env, label: string, actor: string, payload: Params): Promise<Button> {
- return {text:label,callback_data:'a:'+await createAction(e,'panel',null,actor,null,payload)};
+async function panelButton(e: Env, job:Job, label: string, actor: string, payload: Params): Promise<Button> {
+ return {text:label,callback_data:'a:'+await createAction(e,'panel',null,actor,null,payload,now()+15*60_000,`panel:${job.id}:${JSON.stringify(payload)}`)};
+}
+async function sendPanel(e:Env,key:string,text:string,buttons:Button[][]) {
+ const sent=await notify(e,key,null,text,{reply_markup:{inline_keyboard:buttons}});
+ if(sent.status==='success') {
+  const tokens=buttons.flat().flatMap(b=>b.callback_data?[b.callback_data.slice(2)]:[]);
+  if(tokens.length)await e.DB.batch(tokens.map(token=>stmt(e,"UPDATE callback_actions SET payload=json_set(payload,'$.messageId',?) WHERE token=?",sent.result.message_id,token)));
+ }
 }
 async function panel(e: Env, job: Job, actor: string, range: Range) {
  const s = await statistics(e,range);
@@ -228,8 +286,8 @@ async function panel(e: Env, job: Job, actor: string, range: Range) {
  const text = `管理面板 · ${label}\n时区：${s.timezone}\n总注册用户：${s.users.total}\n当前封禁：${s.users.blocked}\n业务消息量：${s.messages.total}\n今日业务消息：${s.today}\n管理员发送成功：${s.messages.success}\n明确失败 / 未送达：${s.messages.failed}\n成功率：${s.rate}\n待处理 / 已阻止：${s.messages.pending}\n结果未知：${s.messages.unknown}\n其他操作异常：${s.anomalies}\n活跃用户：${s.messages.active}\n统计仅含新系统业务原消息；成功表示 API 确认送达，不表示已读。`;
  const ranges: Range[] = ['today','7','30','all'];
  const buttons: Button[] = [];
- for (const r of ranges) buttons.push(await panelButton(e,{today:'今日','7':'7 天','30':'30 天',all:'全部'}[r],actor,{view:'stats',range:r}));
- await notify(e,`job:${job.id}:panel:${range}`,null,text,{reply_markup:{inline_keyboard:[buttons,[await panelButton(e,'用户列表',actor,{view:'users',page:0}),await panelButton(e,'系统设置',actor,{view:'settings'})]]}});
+ for (const r of ranges) buttons.push(await panelButton(e,job,{today:'今日','7':'7 天','30':'30 天',all:'全部'}[r],actor,{view:'stats',range:r}));
+ await sendPanel(e,`job:${job.id}:panel:${range}`,text,[buttons,[await panelButton(e,job,'用户列表',actor,{view:'users',page:0}),await panelButton(e,job,'系统设置',actor,{view:'settings'})]]);
 }
 async function usersPage(e: Env, job: Job, actor: string, page: number) {
  const total = (await one<{count:number}>(e,'SELECT COUNT(*) count FROM users'))!.count;
@@ -237,12 +295,12 @@ async function usersPage(e: Env, job: Job, actor: string, page: number) {
  page = Math.max(0,Math.min(maxPage,Number.isFinite(page) ? Math.floor(page) : 0));
  const rows = await all<UserRow>(e,'SELECT * FROM users ORDER BY first_contact DESC,tgid LIMIT 8 OFFSET ?',page*8);
  const buttons: Button[][] = [];
- for (const u of rows) buttons.push([await panelButton(e,`${u.blocked?'🚫 ':''}${displayName(u).slice(0,35)} · ${u.tgid}`,actor,{view:'user',id:u.tgid})]);
+ for (const u of rows) buttons.push([await panelButton(e,job,`${u.blocked?'🚫 ':''}${displayName(u).slice(0,35)} · ${u.tgid}`,actor,{view:'user',id:u.tgid})]);
  const navigation: Button[] = [];
- if (page>0) navigation.push(await panelButton(e,'上一页',actor,{view:'users',page:page-1}));
- if (page<maxPage) navigation.push(await panelButton(e,'下一页',actor,{view:'users',page:page+1}));
+ if (page>0) navigation.push(await panelButton(e,job,'上一页',actor,{view:'users',page:page-1}));
+ if (page<maxPage) navigation.push(await panelButton(e,job,'下一页',actor,{view:'users',page:page+1}));
  if (navigation.length) buttons.push(navigation);
- await notify(e,`job:${job.id}:users:${page}`,null,`用户列表 · ${page+1}/${maxPage+1} · 共 ${total} 人\n按 TGID 查找：/mb search TGID`,{reply_markup:{inline_keyboard:buttons}});
+ await sendPanel(e,`job:${job.id}:users:${page}`,`用户列表 · ${page+1}/${maxPage+1} · 共 ${total} 人\n按 TGID 查找：/mb search TGID`,buttons);
 }
 async function userDetail(e: Env, job: Job, id: string) {
  const u = await user(e,id);
@@ -315,7 +373,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
  const payload = actionPayload(a);
  if (payload.instance!==e.INSTANCE_ID) {await answer(e,job,cb.id,'实例不匹配。');return;}
  if (a.kind==='panel') {
-  if (!isGeneral(m)) {await answer(e,job,cb.id,'管理面板仅限 General。');return;}
+  if (!isGeneral(m) || payload.messageId!==m.message_id) {await answer(e,job,cb.id,'管理面板仅限原 General 消息。');return;}
   await run(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0',stamp,a.token);
   if (payload.view==='stats' && ['today','7','30','all'].includes(String(payload.range))) await panel(e,job,String(cb.from.id),payload.range as Range);
   else if (payload.view==='users') await usersPage(e,job,String(cb.from.id),Number(payload.page)||0);
@@ -420,6 +478,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<b
  const m = update.message ?? update.edited_message;
  if (!m || String(m.chat.id)!==e.ADMIN_CHAT_ID) return false;
  if (!authorized(e,String(m.from?.id)) || m.sender_chat || m.from?.is_bot) return true;
+ if (internalForward(e,m)) return true;
  const text = m.text ?? '';
  const command = /^\/([a-zA-Z]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(text);
  if (!text.startsWith('/')) {
@@ -434,7 +493,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<b
   }
   return false;
  }
- if (!command || update.edited_message) return true;
+ if (!command || update.edited_message || m.forward_origin) return true;
  if (command[2]) {
   const botName = await setting(e,'bot_username','');
   if (!botName || command[2].toLowerCase()!==botName.toLowerCase()) return true;
@@ -446,6 +505,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<b
  if (name==='sc') {
   const u = thread ? await one<UserRow>(e,'SELECT * FROM users WHERE thread_id=?',thread) : null;
   if (!u) {await notify(e,`job:${job.id}:sc:invalid`,thread,'请在当前有效用户话题中回复一条已知消息执行 /sc。');return true;}
+  if (!await admittedBindingMatches(e,job,m,u)) {await notify(e,`job:${job.id}:sc:stale`,thread,'绑定已变化，旧删除命令未执行。请在当前话题重新确认目标。');return true;}
   await deleteSingle(e,job,m,u);
   return true;
  }
