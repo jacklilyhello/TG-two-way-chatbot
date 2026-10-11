@@ -2,6 +2,7 @@ import type {Env, Job, Params, TGMessage, TGUpdate, TGUser, UserRow} from './typ
 import {all, audit, enqueue, now, one, run, setSetting, setting, stmt, user} from './db';
 import {call, notify, type Outcome} from './operations';
 import {deleteSingle} from './messaging';
+import {DEFAULT_FIXED_TEXT} from './settings';
 
 interface Action {
  token: string; kind: string; user_id: string; actor_id: string; thread_id: number | null;
@@ -253,8 +254,8 @@ async function userDetail(e: Env, job: Job, id: string) {
 }
 async function settingsPanel(e: Env, job: Job) {
  await notify(e,`job:${job.id}:settings`,null,`系统设置\n时区：${await setting(e,'timezone','Asia/Singapore')}\n日志话题：${await setting(e,'log_thread_id','尚未就绪')}\n\n修改：\n/mb timezone Asia/Singapore\n/mb start 新欢迎文案\n/mb help 新帮助文案\n/mb logtopic 专用日志话题ID\n/mb unknown 查看结果未知操作（不自动重发）\n文案变量：{name}、{first_name}、{last_name}、{username}、{tgid}。无用户名时 {username} 显示“未设置”。`);
- await notify(e,`job:${job.id}:settings:start`,null,`欢迎文案：\n${await setting(e,'start_text','你好，{name}。请发送消息联系管理员。')}`);
- await notify(e,`job:${job.id}:settings:help`,null,`帮助文案：\n${await setting(e,'help_text','请发送文字、图片或文件，管理员会人工回复。')}`);
+ await notify(e,`job:${job.id}:settings:start`,null,`欢迎文案：\n${await setting(e,'start_text',DEFAULT_FIXED_TEXT.start)}`);
+ await notify(e,`job:${job.id}:settings:help`,null,`帮助文案：\n${await setting(e,'help_text',DEFAULT_FIXED_TEXT.help)}`);
 }
 async function unknownOperations(e: Env, job: Job) {
  const rows = await all<{op_key:string;method:string;created_at:number}>(e,"SELECT op_key,method,created_at FROM operations WHERE phase='unknown' ORDER BY created_at DESC LIMIT 20");
