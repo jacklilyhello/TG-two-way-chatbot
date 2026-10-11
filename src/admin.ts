@@ -320,11 +320,19 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
  } else if (payload.messageId!==m.message_id) {await answer(e,job,cb.id,'确认消息不匹配。');return;}
  if (a.kind==='card_block' || a.kind==='card_unblock') {
   const blocked = a.kind==='card_block' ? 1 : 0;
-  await e.DB.batch([
-   stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0',stamp,a.token),
-   stmt(e,'UPDATE users SET blocked=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=?)',blocked,u.tgid,a.version,a.thread_id,m.message_id,a.token,stamp)
-  ]);
-  await audit(e,blocked ? 'user_blocked' : 'user_unblocked',{user:u.tgid,actor:String(cb.from.id)});
+  if (a.used===0) {
+   // Audit, state change and consumption commit together. A resumed callback
+   // only repairs its remaining UI operations, never reapplies the mutation.
+   await e.DB.batch([
+    stmt(e,'INSERT INTO audit_logs(event,detail,created_at) SELECT ?,?,? FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked!=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked ? 'user_blocked' : 'user_unblocked',JSON.stringify({user:u.tgid,actor:String(cb.from.id)}),now(),u.tgid,a.version,a.thread_id,m.message_id,blocked,a.token),
+    stmt(e,'UPDATE users SET blocked=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked,u.tgid,a.version,a.thread_id,m.message_id,a.token),
+    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked)
+   ]);
+   const applied = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',a.token);
+   if (applied?.used!==stamp) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
+  } else if (u.blocked!==blocked) {
+   await answer(e,job,cb.id,'操作已处理，请使用当前资料卡。');return;
+  }
   await refreshCard(e,job,u.tgid);
   await answer(e,job,cb.id,blocked ? '已封禁；用户端保持静默。' : '已解除封禁。');
  } else if (a.kind==='card_clear') {
