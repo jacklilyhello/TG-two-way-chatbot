@@ -35,11 +35,13 @@ export function topicLink(e: Env, thread: number, message = thread) {
 }
 export async function ensureUser(e: Env, id: string, profile?: TGUser, contactAt = now()): Promise<UserRow> {
  if (!validUserId(id)) throw new Error('invalid_user_id');
- await run(e,"INSERT OR IGNORE INTO users(tgid,first_contact) VALUES(?,MIN(?,COALESCE((SELECT MIN(received_at) FROM messages WHERE user_id=? AND direction='in'),?)))",id,contactAt,id,contactAt);
+ const queries=[stmt(e,"INSERT OR IGNORE INTO users(tgid,first_contact) VALUES(?,MIN(?,COALESCE((SELECT MIN(received_at) FROM messages WHERE user_id=? AND direction='in'),?)))",id,contactAt,id,contactAt)];
  if (profile && String(profile.id) === id) {
-  await run(e,'UPDATE users SET first_name=?,last_name=?,username=? WHERE tgid=?',profile.first_name ?? '',profile.last_name ?? '',profile.username ?? null,id);
+  queries.push(stmt(e,'UPDATE users SET first_name=?,last_name=?,username=? WHERE tgid=?',profile.first_name ?? '',profile.last_name ?? '',profile.username ?? null,id));
  }
- return (await user(e,id))!;
+ queries.push(stmt(e,'SELECT * FROM users WHERE tgid=?',id));
+ const results=await e.DB.batch<UserRow>(queries);
+ return results.at(-1)!.results[0];
 }
 
 async function createAction(e: Env, kind: string, u: UserRow | null, actor: string, thread: number | null, payload: Params = {}, expires = now()+15*60_000, context?: string) {
@@ -103,14 +105,17 @@ export async function ensureThread(e: Env, job: Job, userId: string, prepareCard
 
 /** Card repair has its own durable lane. Business messages keep their receive
  * order and never wait for profile photos, card buttons or pinning. */
-export async function scheduleCard(e:Env,job:Job,u:UserRow,force=false) {
+export async function scheduleCard(e:Env,job:Job,u:UserRow,force=false,waitUntil?:(promise:Promise<unknown>)=>void) {
  if(!u.thread_id)return;
  const key=`card:${u.tgid}`,time=now();
  await e.DB.batch([
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT ?,?,'card',?,'pending',?,?,? WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE user_key=? AND kind='card' AND epoch=? AND state IN ('pending','retry') AND json_extract(payload,'$.version')=?)",`${key}:${u.binding_version}:${job.id}`,key,JSON.stringify({userId:u.tgid,version:u.binding_version,threadId:u.thread_id,force}),time,e.RECOVERY_EPOCH,time,key,e.RECOVERY_EPOCH,u.binding_version),
   ...(force?[stmt(e,"UPDATE jobs SET payload=json_set(payload,'$.force',json('true')) WHERE user_key=? AND kind='card' AND epoch=? AND state IN ('pending','retry') AND json_extract(payload,'$.version')=?",key,e.RECOVERY_EPOCH,u.binding_version)]:[])
  ]);
- await wakeWork(e,key);
+ // The committed job is recoverable even if either hint fails. A conversation
+ // coordinator can keep the hints alive without making content wait for them.
+ const wake=wakeWork(e,key);
+ if(waitUntil)waitUntil(wake);else await wake;
 }
 
 export async function handleCard(e:Env,job:Job) {
@@ -121,8 +126,8 @@ export async function handleCard(e:Env,job:Job) {
  await refreshCardNow(e,job,u.tgid,p.force===true);
 }
 
-export async function refreshCard(e:Env,job:Job,userId:string,force=false):Promise<void> {
- const u=await user(e,userId);if(u?.thread_id)await scheduleCard(e,job,u,force);
+export async function refreshCard(e:Env,job:Job,userId:string,force=false,waitUntil?:(promise:Promise<unknown>)=>void):Promise<void> {
+ const u=await user(e,userId);if(u?.thread_id)await scheduleCard(e,job,u,force,waitUntil);
 }
 
 function cardText(u: UserRow, timezone: string) {
@@ -363,7 +368,7 @@ async function confirmation(e: Env, job: Job, u: UserRow, actor: string, thread:
 async function answer(e: Env, job: Job, id: string, text: string) {
  await call(e,`job:${job.id}:answer:${id}`,'answerCallbackQuery',{callback_query_id:id,text,show_alert:true});
 }
-async function callbacks(e: Env, job: Job, update: TGUpdate) {
+async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise:Promise<unknown>)=>void) {
  const cb = update.callback_query!;
  const m = cb.message;
  if (!m || String(m.chat.id)!==e.ADMIN_CHAT_ID || !authorized(e,String(cb.from.id)) || String(m.from?.id)!==e.EXPECTED_BOT_ID) return;
@@ -423,7 +428,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
   } else if (u.blocked!==blocked) {
    await answer(e,job,cb.id,'操作已处理，请使用当前资料卡。');return;
   }
-  await refreshCard(e,job,u.tgid);
+  await refreshCard(e,job,u.tgid,false,waitUntil);
   await answer(e,job,cb.id,blocked ? '已封禁；用户端保持静默。' : '已解除封禁。');
  } else if (a.kind==='card_clear') {
   await confirmation(e,job,u,String(cb.from.id),a.thread_id!,'clear_confirm','确认清空此对话？仅删除新系统已知的用户私聊消息。管理员历史与话题保留；旧系统未记录历史无法追溯、数量未知。确认后新消息不在本次范围。',{});
@@ -433,7 +438,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate) {
   if (a.used!==stamp || u.binding_version===a.version) {
    if (!await bind(e,u,to,String(cb.from.id),a,stamp)) {await answer(e,job,cb.id,'绑定状态已变化或目标话题已被占用，请重新 /tj。');return;}
   }
-  await refreshCard(e,job,u.tgid);
+  await refreshCard(e,job,u.tgid,false,waitUntil);
   await answer(e,job,cb.id,'已切换；原话题与消息映射已保留。');
  } else if (a.kind==='cancel') {
   const target = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',payload.target);
@@ -477,8 +482,8 @@ async function register(e: Env, job: Job, m: TGMessage, id: string) {
 }
 
 /** All callback traffic and slash commands are management, never chat payload. */
-export async function handleAdmin(e: Env, job: Job, update: TGUpdate): Promise<boolean> {
- if (update.callback_query) {await callbacks(e,job,update);return true;}
+export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise:Promise<unknown>)=>void): Promise<boolean> {
+ if (update.callback_query) {await callbacks(e,job,update,waitUntil);return true;}
  const m = update.message ?? update.edited_message;
  if (!m || String(m.chat.id)!==e.ADMIN_CHAT_ID) return false;
  if (!authorized(e,String(m.from?.id)) || m.sender_chat || m.from?.is_bot) return true;

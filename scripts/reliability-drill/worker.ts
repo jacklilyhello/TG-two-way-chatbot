@@ -80,16 +80,31 @@ export class DrillApiStub {
 function webhook(e:DrillEnv,id:number,user=target) {
  return new Request(`https://${e.DRILL_HOSTNAME}/webhook`,{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Bot-Api-Secret-Token':e.TELEGRAM_WEBHOOK_SECRET},body:JSON.stringify({update_id:id,message:{message_id:id,date:1,chat:{id:user,type:'private'},from:{id:user},text:'synthetic reliability fixture'}})});
 }
-function faultDatabase(db:D1Database,stage:'prepare'|'batch'):D1Database {
- return new Proxy(db,{get(object,key){if(key===stage)return ()=>{throw new Error(`controlled_${stage}_failure`);};const value=Reflect.get(object,key);return typeof value==='function'?value.bind(object):value;}});
+function faultDatabase(db:D1Database,stage:'prepare'|'completion'):D1Database {
+ const completion=new WeakSet<D1PreparedStatement>();
+ return new Proxy(db,{get(object,key){
+  if(key==='prepare')return (sql:string)=>{
+   if(stage==='prepare')throw new Error('controlled_prepare_failure');
+   const statement=object.prepare(sql);
+   if(!sql.startsWith('UPDATE operations SET phase=?'))return statement;
+   return new Proxy(statement,{get(prepared,property){
+    if(property==='bind')return (...args:unknown[])=>{const bound=prepared.bind(...args);completion.add(bound);return bound;};
+    const value=Reflect.get(prepared,property);return typeof value==='function'?value.bind(prepared):value;
+   }});
+  };
+  // Preflight may also use batch. Inject only when persisting the API outcome,
+  // after the Bot journal and the separate synthetic effect are durable.
+  if(key==='batch')return (statements:D1PreparedStatement[])=>{if(statements.some(statement=>completion.has(statement)))throw new Error('controlled_completion_failure');return object.batch(statements);};
+  const value=Reflect.get(object,key);return typeof value==='function'?value.bind(object):value;
+ }});
 }
 async function operation(e:DrillEnv,key:string,completionFault=false) {
  try {
-  const result=await call(completionFault?{...e,DB:faultDatabase(e.DB,'batch')}:e,key,'copyMessage',params);
+  const result=await call(completionFault?{...e,DB:faultDatabase(e.DB,'completion')}:e,key,'copyMessage',params);
   return {result,count:await count(e,key),phase:(await one<{phase:string}>(e,'SELECT phase FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`))?.phase};
  } catch(error) {
   if(error instanceof RetryLater)return {deferred:true,due:error.due,count:await count(e,key),phase:(await one<{phase:string}>(e,'SELECT phase FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`))?.phase};
-  if(completionFault&&error instanceof Error&&error.message==='controlled_batch_failure')return {completionFailed:true,count:await count(e,key),phase:(await one<{phase:string}>(e,'SELECT phase FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`))?.phase};
+  if(completionFault&&error instanceof Error&&error.message==='controlled_completion_failure')return {completionFailed:true,count:await count(e,key),phase:(await one<{phase:string}>(e,'SELECT phase FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${key}`))?.phase};
   throw error;
  }
 }

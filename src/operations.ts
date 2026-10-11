@@ -37,12 +37,18 @@ export async function reconcileIssued(e:Env):Promise<number> {
 export async function call<T = any>(e: Env,key: string,method: string,params: Params,guard?:IssueGuard): Promise<Outcome<T>> {
  const entered=now();
  const opKey = `${e.RECOVERY_EPOCH}:${key}`;
- const old=await one<Ledger>(e,'SELECT * FROM operations WHERE op_key=?',opKey);
+ // These statements share one D1 transaction and round trip. Read the prior
+ // result before inserting; terminal outcomes still return before pause/issue.
+ const [prior,,pause]=await e.DB.batch([
+  e.DB.prepare('SELECT * FROM operations WHERE op_key=?').bind(opKey),
+  e.DB.prepare("INSERT OR IGNORE INTO operations(op_key,method,phase,created_at,updated_at) VALUES(?,?,'prepared',?,?)").bind(opKey,method,entered,entered),
+  e.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'")
+ ]);
+ const old=prior.results[0] as unknown as Ledger|undefined;
  if(old?.phase==='success') return {status:'success',result:JSON.parse(old.result!),...(method==='setMessageReaction'?{confirmedAt:old.updated_at}:{})};
  const retryRead=old?.phase==='unknown'&&old.method===method&&method.startsWith('get');
  if(old?.phase==='failed'||(old?.phase==='unknown'&&!retryRead)) return {status:old.phase,reason:old.reason||'发生未知情况',code:old.code??undefined};
- await run(e,"INSERT OR IGNORE INTO operations(op_key,method,phase,created_at,updated_at) VALUES(?,?,'prepared',?,?)",opKey,method,now(),now());
- if(e.PAUSED==='true'||await one(e,"SELECT key FROM settings WHERE key='paused' AND value='1'")) throw new RetryLater(now()+60000);
+ if(e.PAUSED==='true'||pause.results.length) throw new RetryLater(now()+60000);
  const started=now();
  await run(e,"UPDATE operations SET phase='issued',updated_at=?,call_started_at=COALESCE(call_started_at,?),call_attempts=call_attempts+1,prepare_ms=prepare_ms+? WHERE op_key=?",started,started,Math.max(0,started-entered),opKey);
  // The Bot DO keeps an independent response journal across D1 write failure.

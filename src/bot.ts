@@ -55,15 +55,24 @@ export class BotCoordinator {
   const chatAt=chat?await this.state.storage.get<number>(chatRateKey)??0:0;
   const due=exempt?backoffAt:Math.max(globalAt,chatAt,backoffAt);
   if(time<due) return Response.json({due},{status:429});
+  const checks:D1PreparedStatement[]=[];
+  const hiddenIndex=guard?.messageIds?.length?checks.push(this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds))-1:-1;
+  const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
+  // Complex guards perform additional reads. Keep pause after those reads so
+  // it remains the final safety check, while ordinary sends use one D1 batch.
+  const deferPause=!!(guard?.receipt||guard?.deliveryRetry);
+  const pauseIndex=!deferPause&&this.env.PAUSED!=='true'?checks.push(this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'"))-1:-1;
+  const checked=checks.length?await this.env.DB.batch(checks):[];
   if(guard) {
-   const hidden=guard.messageIds?.length?await this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds).first():null;
-   const binding=guard.threadVersion?await this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId).first<{binding_version:number;thread_id:number}>():null;
+   const hidden=hiddenIndex>=0&&checked[hiddenIndex].results.length>0;
+   const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number}|undefined:undefined;
    if(hidden||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
     const outcome:Outcome={status:'failed',reason:'cancelled_by_state',code:409};
     await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
    }
   }
-  if(this.env.PAUSED==='true'||await this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'").first())return Response.json({due:time+60000},{status:429});
+  const paused=this.env.PAUSED==='true'||(deferPause?await this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'").first():pauseIndex>=0&&checked[pauseIndex].results.length>0);
+  if(paused)return Response.json({due:time+60000},{status:429});
   if(reaction && guard?.receipt && !guard.receipt.clear && guard.receipt.emoji==='👍' && await dueReceiptCleanup(this.env,time))return Response.json({due:time+100},{status:429});
   if(!exempt) {
    const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;

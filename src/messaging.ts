@@ -261,7 +261,7 @@ async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string
 }
 
 /** Handles only persisted business messages. Administrative commands are routed first. */
-export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: boolean): Promise<void> {
+export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: boolean, waitUntil?:(promise:Promise<unknown>)=>void): Promise<void> {
   if (internalForward(e, m)) return;
   const privateChat = m.chat.type === 'private' && String(m.chat.id) === String(m.from?.id) && !m.from?.is_bot;
   if (!privateChat && !authorised(e, m)) return;
@@ -292,13 +292,19 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     return;
   }
   if (privateChat) {
-    u = await ensureThread(e, job, u.tgid, false);
+    // ensureUser just returned the current binding. The Bot's final guard
+    // rejects a later binding change before any new external side effect.
+    if (!u.thread_id) u = await ensureThread(e, job, u.tgid, false);
     if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id}); return;}
-    await scheduleCard(e, job, u);
+    await scheduleCard(e, job, u, false, waitUntil);
   }
-  row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
-  if (!row || row.tombstone || row.deletion !== 'none') return;
-  if (m.media_group_id) {await album(e, job, row, m, u); return;}
+  if (m.media_group_id) {
+    row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
+    if (!row || row.tombstone || row.deletion !== 'none') return;
+    await album(e, job, row, m, u); return;
+  }
+  // copyOne rechecks the current row before preparing its request. Album
+  // batches and terminal receipt recovery retain their own state reads.
   if (row.delivery === 'pending') await copyOne(e, row, m, u);
   else if (row.direction === 'out') {await syncReceipt(e, row.id);await restoreDeliveryNotice(e,row);}
 }

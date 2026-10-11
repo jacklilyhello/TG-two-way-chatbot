@@ -4,6 +4,7 @@ import type {Env,TGUpdate} from '../src/types';
 import {accept} from '../src/ingress';
 import {call,RetryLater} from '../src/operations';
 import {BotCoordinator} from '../src/bot';
+import {failOperationCompletion} from './completion-fault';
 import {one,run,all} from '../src/db';
 const e=env as unknown as Env;
 const update=(id:number):TGUpdate=>({update_id:id,message:{message_id:id,date:1791700000,chat:{id:20001,type:'private'},from:{id:20001,first_name:'Test'},text:'hello'}});
@@ -97,8 +98,10 @@ describe('Telegram request outcomes',()=>{
  });
  it('persists successful Telegram result through a D1 completion failure',async()=>{
   vi.mocked(fetch).mockResolvedValueOnce(Response.json({ok:true,result:{message_id:999}}));
-  const broken={...client,DB:{prepare:e.DB.prepare.bind(e.DB),batch:async()=>{throw new Error('D1 completion interrupted');}}} as Env;
+  const broken={...client,DB:failOperationCompletion(e.DB,'D1 completion interrupted')};
   await expect(call(broken,'d1-lost','sendMessage',{chat_id:20001,text:'x'})).rejects.toThrow('D1 completion interrupted');
+  expect(await one(e,"SELECT phase FROM operations WHERE op_key='initial:d1-lost'")).toEqual({phase:'issued'});
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   expect(await call(client,'d1-lost','sendMessage',{chat_id:20001,text:'x'})).toEqual({status:'success',result:{message_id:999}});
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
  });
