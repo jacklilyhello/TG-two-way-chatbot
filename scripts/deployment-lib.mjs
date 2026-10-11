@@ -1,4 +1,16 @@
 import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+
+export async function awaitReleaseHealth(url, version, { fetcher = fetch, wait = delay, attempts = 6 } = {}) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const response = await fetcher(url, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10000) });
+      if (response.ok && (await response.json()).version === version) return;
+    } catch { /* A new custom domain may need DNS/TLS propagation; only repeat reads. */ }
+    if (attempt + 1 < attempts) await wait(5000);
+  }
+  throw new Error('Deployed health endpoint did not confirm requested release after bounded read-only readiness checks');
+}
 
 export function assertWebhookChange(info, url, stopped) {
   if (info.url !== url && stopped !== true) throw new Error('Webhook takeover requires confirmed stopped old consumer and drained outbound requests');
@@ -40,6 +52,15 @@ export function assertRemoteIdentity(config, settings) {
   if (coordinators.length !== 2 || !coordinators.some(b => b.name === 'CONVERSATIONS' && b.class_name === 'ConversationCoordinator') || !coordinators.some(b => b.name === 'BOT' && b.class_name === 'BotCoordinator')) throw new Error('Existing Worker coordinator bindings are incomplete');
   for (const binding of bindings.filter(b => b.type === 'durable_object_namespace')) {
     if (binding.script_name && binding.script_name !== config.worker_name) throw new Error('Cross-Worker Durable Object namespace is forbidden');
+  }
+}
+
+export function assertQueueConsumers(consumers, workerName) {
+  for (const consumer of consumers ?? []) {
+    // Queue detail responses use `script`; the consumer API also documents
+    // `script_name`. Require every supplied identity to match the same Worker.
+    const identities = [consumer.script, consumer.script_name].filter(value => value !== undefined);
+    if (consumer.type !== 'worker' || identities.length === 0 || identities.some(value => value !== workerName)) throw new Error('Instance queue has another or unidentified consumer');
   }
 }
 
