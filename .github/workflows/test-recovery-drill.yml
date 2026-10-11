@@ -1,0 +1,124 @@
+name: Test D1 recovery drill
+run-name: Test recovery ${{ inputs.instance }}
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: Authorized independent test instance only
+        required: true
+        type: choice
+        options: [test-a, test-b]
+      release_sha:
+        description: Exact main CI-passing SHA already deployed on this test instance
+        required: true
+        type: string
+      bookmark_sha256:
+        description: SHA256 of exact selected TEST_RECOVERY_BOOKMARK Environment Secret; no automatic point selection
+        required: true
+        type: string
+      new_epoch_sha256:
+        description: SHA256 of fresh epoch already saved privately in this Environment INSTANCE_CONFIG_JSON
+        required: true
+        type: string
+      confirm_test_restore:
+        description: Restore only authorized test data; keep maintenance paused afterward
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: instance-${{ inputs.instance }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate selected test release and successful main CI
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          INSTANCE_ID: ${{ inputs.instance }}
+          CONFIRM_TEST_RESTORE: ${{ inputs.confirm_test_restore }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e 'if (!/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA) || !["test-a","test-b"].includes(process.env.INSTANCE_ID) || process.env.CONFIRM_TEST_RESTORE !== "true") process.exit(1)'
+          git cat-file -e "$RELEASE_SHA^{commit}"
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&status=success&per_page=100" --jq '.workflow_runs | any(.head_sha == env.RELEASE_SHA and .event == "push" and .head_branch == "main")' | grep -qx true
+  drill:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: tg-two-way-${{ inputs.instance }}
+    env:
+      INSTANCE_ID: ${{ inputs.instance }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      RESTORE_BOOKMARK_SHA256: ${{ inputs.bookmark_sha256 }}
+      NEW_RECOVERY_EPOCH_SHA256: ${{ inputs.new_epoch_sha256 }}
+      CONFIRM_TEST_RESTORE: ${{ inputs.confirm_test_restore }}
+      TEST_RECOVERY_DRILL_ALLOWED: ${{ vars.TEST_RECOVERY_DRILL_ALLOWED }}
+      BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Install backup encryption utility
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age
+      - name: Validate drill guards without cloud writes
+        run: node --test scripts/test-recovery-drill.node-test.mjs
+      - name: Pause, install static retry gate and encrypt current test database
+        env:
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+          RESTORE_BOOKMARK: ${{ secrets.TEST_RECOVERY_BOOKMARK }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: node scripts/test-recovery-drill.mjs prepare
+      - name: Save encrypted pre-restore backup before permitting restore
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-recovery-backup-${{ inputs.instance }}-${{ github.run_id }}
+          path: |
+            .local/recovery-drill/database-before.sql.age
+            .local/recovery-drill/restore-points.json.age
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Restore explicit bookmark and quarantine while statically paused
+        env:
+          RECOVERY_BACKUP_SAVED: 'true'
+          INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
+          RESTORE_BOOKMARK: ${{ secrets.TEST_RECOVERY_BOOKMARK }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: node scripts/test-recovery-drill.mjs restore
+      - name: Save aggregate recovery evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-recovery-evidence-${{ inputs.instance }}-${{ github.run_id }}
+          path: .local/recovery-drill/evidence.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove this drill private runner files
+        if: always()
+        run: rm -rf .local/recovery-drill

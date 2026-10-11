@@ -5,7 +5,9 @@
 ```sh
 npm ci
 npm run check
-node --test scripts/deployment.node-test.mjs
+node --test scripts/*.node-test.mjs
+npx tsc -p scripts/reliability-drill/tsconfig.json
+npx vitest run --config scripts/reliability-drill/vitest.config.ts
 node scripts/check-instances.mjs
 npm run build
 npm audit --audit-level=high
@@ -48,3 +50,11 @@ Worker 测试使用本地 Cloudflare 绑定与 Telegram 接口模拟，重点覆
 5. 在测试实例执行受控 D1 恢复演练，核对暂停闸门、全新恢复代次、旧任务隔离及未知项保留，最后再显式恢复。不能把单纯恢复 SQL 或 `/health` 200 当作恢复验收。
 
 最终检查应与 [V4.0 验收清单](requirements-v4.md#181-验收清单) 对照。只有真实证据支持的项目才能报告完成。
+
+### 独立云端可靠性演练
+
+`Isolated cloud reliability drill` 工作流只接受两个授权测试别名和通过 main CI 的完整 SHA。显式选择创建合成资源后，它在所选测试域名的精确 `/__reliability-drill` 路径临时运行专用 Worker，使用新的 D1、Queue 和 DO；不会绑定业务实例的存储或加载真实 Telegram Token。入口带临时授权密钥，演练代码没有外网转发后备路径，使用独立持久 DO 作为 Telegram 接口替身。
+
+演练覆盖云端绑定层注入的 D1 接收失败、Queue 通知失败、429 延迟、D1 结果落库失败、实际 DO 中止/重建、未知结果不重发和第二次 Worker 部署后的持久记录。D1/Queue 异常来自受控绑定适配器，不表示真的制造了 Cloudflare 平台故障；接口替身结果也不属于真实 Telegram 业务验收。
+
+结束时只移除本次创建且读回确认归属的精确临时路由，保留合成持久资源供核查，Worker 的 workers.dev 和预览地址均禁用。失败或中断后先检查聚合 artifact、精确路由和命名资源，不得把另一次运行当作此前未知写操作的重试。数据库恢复另用[测试恢复工作流](operations.md#独立测试实例恢复工作流)，真实双向消息另用上述浏览器验收清单。

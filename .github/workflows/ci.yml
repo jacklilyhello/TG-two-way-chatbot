@@ -22,7 +22,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
-      - run: node --test scripts/deployment.node-test.mjs
+      - run: node --test scripts/*.node-test.mjs
+      - run: npx tsc -p scripts/reliability-drill/tsconfig.json
+      - run: npx vitest run --config scripts/reliability-drill/vitest.config.ts
       - run: node scripts/check-instances.mjs
       - run: npm run build
       - run: npm audit --audit-level=high

@@ -1,0 +1,8 @@
+{
+ "name":"tg-two-way-reliability-local","main":"worker.ts","compatibility_date":"2026-10-11","compatibility_flags":["nodejs_compat"],"workers_dev":false,
+ "vars":{"INSTANCE_ID":"test-a","EXPECTED_BOT_ID":"42424240","ADMIN_CHAT_ID":"-1004242424242","ADMIN_IDS":"42424240","VERSION":"synthetic-local","RECOVERY_EPOCH":"drill-1234-1","TELEGRAM_BOT_TOKEN":"0:reliability-drill-only","TELEGRAM_WEBHOOK_SECRET":"synthetic-drill-webhook","DRILL_RUN_ID":"1234-1","DRILL_HOSTNAME":"synthetic-a.lilyya.top","DRILL_REVISION":"1","DRILL_KEY":"synthetic-drill-authorization-key-for-local-tests-only"},
+ "d1_databases":[{"binding":"DB","database_name":"tg-two-way-reliability-local-db","database_id":"00000000-0000-0000-0000-000000000001","migrations_dir":"../../migrations"}],
+ "queues":{"producers":[{"binding":"JOBS","queue":"tg-two-way-reliability-local-jobs"}],"consumers":[{"queue":"tg-two-way-reliability-local-jobs","max_batch_size":1,"max_batch_timeout":1,"max_retries":3}]},
+ "durable_objects":{"bindings":[{"name":"BOT","class_name":"DrillBotCoordinator"},{"name":"CONVERSATIONS","class_name":"ConversationCoordinator"},{"name":"STUB","class_name":"DrillApiStub"}]},
+ "migrations":[{"tag":"reliability-v1","new_sqlite_classes":["DrillBotCoordinator","ConversationCoordinator","DrillApiStub"]}]
+}
