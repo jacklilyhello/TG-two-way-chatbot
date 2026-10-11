@@ -6,6 +6,7 @@ import {clearConversation, deleteSingle, handleDeliveryNotice, handleMessage, ha
 import {call, RetryLater, type Outcome} from '../src/operations';
 import {accept} from '../src/ingress';
 import {handleAdmin} from '../src/admin';
+import {syncReceipt} from '../src/receipts';
 
 interface Request {key: string; method: string; params: Params}
 let e: Env;
@@ -154,16 +155,52 @@ describe('persistent messaging and deletion invariants', () => {
   });
 
   it('/sc on one album member deletes only that private message and reports a partial group', async () => {
-    const first = await record(adminMessage(105, {media_group_id: 'album-delete'}));
-    const second = await record(adminMessage(106, {media_group_id: 'album-delete'}));
-    await run(e, "UPDATE messages SET private_id=source_id+1000,delivery='success' WHERE id IN (?,?)", first.id, second.id);
-    const command = adminMessage(107, {text: '/sc', reply_to_message: adminMessage(106)});
+    const first = await record(privateMessage(105, {media_group_id: 'album-delete'}));
+    const second = await record(privateMessage(106, {media_group_id: 'album-delete'}));
+    await run(e, "UPDATE messages SET admin_id=source_id+1000,thread_id=77,delivery='success' WHERE id IN (?,?)", first.id, second.id);
+    const command = adminMessage(107, {text: '/sc', reply_to_message: adminMessage(1106)});
     await deleteSingle(e, job(15, command), command, (await user(e, '42'))!);
-    expect(requests.filter(r => r.method === 'deleteMessage').map(r => r.params)).toEqual([{chat_id: '42', message_id: 1106}]);
-    await handleReaction(e, (await one<Job>(e, "SELECT * FROM jobs WHERE kind='reaction'"))!);
-    expect(requests.filter(r => r.method === 'setMessageReaction').map(r => r.params.reaction)).toEqual([[]]);
+    expect(requests.filter(r => r.method === 'deleteMessage').map(r => r.params)).toEqual([{chat_id: '42', message_id: 106}]);
+    expect(await one(e, 'SELECT * FROM receipts')).toBeNull();
+    expect(await one(e, "SELECT * FROM jobs WHERE kind='reaction'")).toBeNull();
+    expect(requests.filter(r => r.method === 'setMessageReaction')).toEqual([]);
     expect(requests.some(r => r.method === 'sendMessage' && String(r.params.text).includes('已确认1/2'))).toBe(true);
     expect(await one(e, 'SELECT deletion FROM messages WHERE id=?', first.id)).toEqual({deletion: 'none'});
+  });
+
+  it('clears an untracked legacy outgoing album marker after partial deletion',async()=>{
+    const first=await record(adminMessage(189,{media_group_id:'legacy-album'}));
+    const second=await record(adminMessage(190,{media_group_id:'legacy-album'}));
+    await run(e,"UPDATE messages SET private_id=source_id+1000,delivery='success' WHERE id IN (?,?)",first.id,second.id);
+    await run(e,"INSERT INTO operations(op_key,method,phase,result,created_at,updated_at) VALUES(?,'setMessageReaction','success','true',1,1)",`${e.RECOVERY_EPOCH}:album:${e.ADMIN_CHAT_ID}:legacy-album:album-reaction:2`);
+    const command=adminMessage(191,{text:'/sc',reply_to_message:adminMessage(190)});
+    await deleteSingle(e,job(192,command),command,(await user(e,'42'))!);
+    await handleReaction(e,(await one<Job>(e,"SELECT * FROM jobs WHERE kind='reaction'"))!);
+    expect(requests.filter(r=>r.method==='setMessageReaction').map(r=>r.params.reaction)).toEqual([[]]);
+    expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:album:${e.ADMIN_CHAT_ID}:legacy-album:album-reaction:2`)).toEqual({phase:'success'});
+  });
+
+  it.each(['success','unknown'] as const)('clears a tracked %s album marker after partial deletion while retiring its obsolete jobs',async status=>{
+    const first=await record(adminMessage(185,{media_group_id:'tracked-album'}));
+    const second=await record(adminMessage(186,{media_group_id:'tracked-album'}));
+    await run(e,"UPDATE messages SET private_id=source_id+1000,delivery='success' WHERE id IN (?,?)",first.id,second.id);
+    await syncReceipt(e,first.id);
+    const original=(await one<Job>(e,"SELECT * FROM jobs WHERE kind='reaction'"))!;
+    const normal=handler;
+    handler=request=>request.method==='setMessageReaction'&&status==='unknown'?{status:'unknown',reason:'synthetic marker result unknown'}:normal(request);
+    await handleReaction(e,original);
+    const prior=(await all<Job>(e,"SELECT * FROM jobs WHERE kind='reaction'"));
+    handler=normal;
+    const command=adminMessage(187,{text:'/sc',reply_to_message:adminMessage(186)});
+    await deleteSingle(e,job(188,command),command,(await user(e,'42'))!);
+    for(const old of prior)expect(await one(e,'SELECT state FROM jobs WHERE id=?',old.id)).toEqual({state:'done'});
+    expect(await one(e,'SELECT version,emoji,phase FROM receipts WHERE row_id=?',first.id)).toEqual({version:2,emoji:null,phase:'pending'});
+    const replacement=(await one<Job>(e,"SELECT * FROM jobs WHERE kind='reaction' AND json_extract(payload,'$.version')=2"))!;
+    await handleReaction(e,replacement);
+    for(const old of prior)await handleReaction(e,old);
+    expect(requests.filter(r=>r.method==='setMessageReaction').map(r=>r.params.reaction)).toEqual([[{type:'emoji',emoji:'👍'}],[]]);
+    expect(await one(e,'SELECT deletion FROM messages WHERE id=?',first.id)).toEqual({deletion:'none'});
+    expect(await one(e,'SELECT deletion FROM messages WHERE id=?',second.id)).toEqual({deletion:'deleted'});
   });
 
   it('never revives deleted content and rejects stale edits, including ties within one second', async () => {
@@ -260,10 +297,14 @@ describe('persistent messaging and deletion invariants', () => {
     await snapshot('bounded');
     await record(privateMessage(145));
     await clearConversation(e, job(40), (await user(e, '42'))!, 'bounded');
-    expect(requests.filter(r => r.method === 'deleteMessage')).toHaveLength(20);
-    const continuation = await one<Job>(e, "SELECT * FROM jobs WHERE kind='clear'");
-    expect(JSON.parse(continuation!.payload)).toEqual({batchId: 'bounded'});
-    await clearConversation(e, continuation!, (await user(e, '42'))!, 'bounded');
+    expect(requests.filter(r => r.method === 'deleteMessage')).toHaveLength(2);
+    for (let round = 0; round < 20; round++) {
+      const continuation = await one<Job>(e, "SELECT * FROM jobs WHERE kind='clear' AND state='pending' ORDER BY id LIMIT 1");
+      if (!continuation) break;
+      expect(JSON.parse(continuation.payload)).toEqual({batchId: 'bounded'});
+      await clearConversation(e, continuation, (await user(e, '42'))!, 'bounded');
+      await run(e, "UPDATE jobs SET state='done' WHERE id=?", continuation.id);
+    }
     expect(requests.filter(r => r.method === 'deleteMessage')).toHaveLength(25);
     expect(requests.some(r => r.method === 'deleteMessage' && r.params.message_id === 145)).toBe(false);
     expect(await one(e, "SELECT state FROM deletion_batches WHERE id='bounded'")).toEqual({state: 'done'});

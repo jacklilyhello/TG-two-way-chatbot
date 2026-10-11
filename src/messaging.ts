@@ -8,7 +8,8 @@ import {internalForward, admittedBindingMatches, albumMemberBindingMatches} from
 import {bindRetryNotice, deliveryRetryButton, latestDelivery, type DeliveryAttempt} from './delivery-retry';
 export {handleReaction} from './receipts';
 
-const CLEAR_LIMIT = 20;
+const CLEAR_LIMIT = 2;
+const CLEAR_BUDGET_MS = 2000;
 const ALBUM_QUIET_MS = 1200;
 const authorised = (e: Env, m: TGMessage) => String(m.chat.id) === e.ADMIN_CHAT_ID && !m.sender_chat && !m.from?.is_bot && e.ADMIN_IDS.split(',').map(x => x.trim()).includes(String(m.from?.id));
 const groupKey = (m: TGMessage) => `${m.chat.id}:${m.media_group_id}`;
@@ -151,7 +152,9 @@ async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: st
   if (success === rows.length) {
     if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id);
   } else if (!pending || deleting) {
-    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, deleting);
+    // Incoming albums never receive a delivery marker. Outgoing albums may
+    // retain a legacy successful mark from before receipt tracking existed.
+    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, deleting && row.direction === 'out');
     const unknown = rows.filter(r => deleting ? r.deletion === 'unknown' : r.delivery === 'unknown').length;
     await notify(e, `${scope}:album-summary:${success}:${unknown}:${rows.length}`, anchor.thread_id, `相册${deleting ? '删除' : '投递'}：已确认${success}/${rows.length}，未知${unknown}，其余${rows.length - success - unknown}。${deleting ? '仅处理选定条目，群内原件和历史保留。' : ''}`);
   }
@@ -356,19 +359,25 @@ export async function deleteSingle(e: Env, job: Job, m: TGMessage, u: UserRow): 
 
 /** Only an ingress-captured, tombstoned snapshot may be cleared. */
 export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: string): Promise<void> {
+  const started = now();
   if (!batchId) return;
   const batch = await one<{user_id: string; state: string}>(e, 'SELECT user_id,state FROM deletion_batches WHERE id=?', batchId);
   if (!batch || batch.user_id !== u.tgid || batch.state === 'done') return;
   const items = await all<{message_id: number}>(e, "SELECT message_id FROM deletion_items WHERE batch_id=? AND result='pending' ORDER BY message_id LIMIT ?", batchId, CLEAR_LIMIT);
+  let processedThrough: number | undefined;
   for (const item of items) {
     const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=? AND user_id=?', item.message_id, u.tgid);
     const result = row ? await deleteRow(e, row, `clear:${batchId}:${row.id}`) : 'unavailable';
     await run(e, 'UPDATE deletion_items SET result=? WHERE batch_id=? AND message_id=?', result, batchId, item.message_id);
     if (row?.admin_id && !row.media_group && result === 'deleted') await syncReceipt(e, row.id);
+    processedThrough = item.message_id;
+    // Yield only after the external result and this item are durable. Never
+    // interrupt an in-flight deletion or reuse the unprocessed selection tail.
+    if (now() - started >= CLEAR_BUDGET_MS) break;
   }
   const pending = await one<{n: number}>(e, "SELECT COUNT(*) n FROM deletion_items WHERE batch_id=? AND result='pending'", batchId);
   if (pending?.n) {
-    await enqueue(e, u.tgid, 'clear', {batchId}, `clear:${batchId}:after:${items.at(-1)?.message_id ?? job.id}`);
+    await enqueue(e, u.tgid, 'clear', {batchId}, `clear:${batchId}:after:${processedThrough ?? job.id}`);
     return;
   }
   // Recalculate all affected albums once the batch has a final result, including
