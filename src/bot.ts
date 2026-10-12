@@ -3,6 +3,7 @@ import type {Outcome,IssueGuard} from './operations';
 import {dueReceiptCleanup,receiptGuardValid} from './receipts';
 import {deliveryRetryGuardValid} from './delivery-retry';
 const allowed = new Set(['getMe','getChat','getChatMember','getUserProfilePhotos','createForumTopic','editForumTopic','sendMessage','sendPhoto','sendMediaGroup','copyMessage','editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','pinChatMessage','unpinChatMessage','setMessageReaction','deleteMessage','answerCallbackQuery','setMyCommands']);
+const nonSending = new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','deleteMessage','unpinChatMessage']);
 interface RequestBody {key:string;method:string;params:Params;guard?:IssueGuard}
 interface Journal {phase:'issued'|'done';outcome?:Outcome;apiMs?:number}
 /** Bot-wide serialization, durable result journal and conservative shared-chat limits. */
@@ -42,19 +43,17 @@ export class BotCoordinator {
    const outcome:Outcome={status:'unknown',reason:'发生未知情况：请求已发出，无法确认结果'};
    await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
   }
-  const time=Date.now();
   const chat=String(params.chat_id??'');
   const exempt=method.startsWith('get')||method==='answerCallbackQuery';
-  // Reactions change the bot's own mark; they do not send a group message.
-  // Keep their own conservative per-chat pace, while preserving the shared
-  // 20-message/minute group-send budget and all Telegram retry_after pauses.
+  // Edits, deletes and unpins do not send a new message. Keep one conservative
+  // mutation lane beside sends and reactions; all share global/backoff limits.
   const reaction=method==='setMessageReaction';
-  const chatRateKey=reaction?`rate:reaction:${chat}`:`rate:${chat}`;
+  const chatRateKey=reaction?`rate:reaction:${chat}`:nonSending.has(method)?`rate:mutation:${chat}`:`rate:${chat}`;
   const globalAt=await this.state.storage.get<number>('rate:global')??0;
   const backoffAt=await this.state.storage.get<number>('rate:backoff')??0;
   const chatAt=chat?await this.state.storage.get<number>(chatRateKey)??0:0;
   const due=exempt?backoffAt:Math.max(globalAt,chatAt,backoffAt);
-  if(time<due) return Response.json({due},{status:429});
+  if(Date.now()<due) return Response.json({due},{status:429});
   const checks:D1PreparedStatement[]=[];
   const hiddenIndex=guard?.messageIds?.length?checks.push(this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds))-1:-1;
   const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
@@ -72,13 +71,11 @@ export class BotCoordinator {
    }
   }
   const paused=this.env.PAUSED==='true'||(deferPause?await this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'").first():pauseIndex>=0&&checked[pauseIndex].results.length>0);
-  if(paused)return Response.json({due:time+60000},{status:429});
-  if(reaction && guard?.receipt && !guard.receipt.clear && guard.receipt.emoji==='👍' && await dueReceiptCleanup(this.env,time))return Response.json({due:time+100},{status:429});
-  if(!exempt) {
-   const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;
-   await this.state.storage.put({'rate:global':time+40*messageCount,...(chat?{[chatRateKey]:time+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})});
-  }
-  await this.state.storage.put(journalKey,{phase:'issued'});
+  if(paused)return Response.json({due:Date.now()+60000},{status:429});
+  if(reaction && guard?.receipt && !guard.receipt.clear && guard.receipt.emoji==='👍' && await dueReceiptCleanup(this.env,Date.now()))return Response.json({due:Date.now()+100},{status:429});
+  const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;
+  const reservation=(at:number)=>exempt?{}:{'rate:global':at+40*messageCount,...(chat?{[chatRateKey]:at+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})};
+  await this.state.storage.put({[journalKey]:{phase:'issued'},...reservation(Date.now())});
   let outcome:Outcome;
   const apiStartedAt=Date.now();
   try {
@@ -89,7 +86,7 @@ export class BotCoordinator {
     const retry=Number(body.parameters?.retry_after);
     const retryAt=Date.now()+Math.max(1000,Number.isFinite(retry)?retry*1000:60000);
     await this.state.storage.delete(journalKey);
-    await this.state.storage.put({'rate:backoff':Math.max(backoffAt,retryAt),'rate:global':Math.max(globalAt,retryAt)});
+    await this.state.storage.put({...reservation(apiStartedAt),'rate:backoff':Math.max(backoffAt,retryAt),'rate:global':Math.max(globalAt,exempt?0:apiStartedAt+40*messageCount,retryAt)});
     return this.result({due:retryAt},Date.now()-apiStartedAt,429);
    } else if(body.ok===false&&typeof body.error_code==='number'&&body.error_code>=400&&body.error_code<500) {
     const reason=(body.description??'Telegram 拒绝请求').replaceAll(this.env.TELEGRAM_BOT_TOKEN,'[redacted]').replaceAll(this.env.TELEGRAM_WEBHOOK_SECRET,'[redacted]').slice(0,240);
@@ -100,7 +97,9 @@ export class BotCoordinator {
   } catch {outcome={status:'unknown',reason:'发生未知情况：网络中断、超时或响应格式错误'};}
   const apiMs=Math.max(0,Date.now()-apiStartedAt);
   if(method.startsWith('get')&&outcome.status==='unknown'){await this.state.storage.delete(journalKey);return this.result({due:Date.now()+5000},apiMs,429);}
-  await this.state.storage.put(journalKey,{phase:'done',outcome,apiMs});
+  // A slow durable reservation can finish after its first deadline. Persist
+  // the actual API-start anchor with the result before the next request runs.
+  await this.state.storage.put({[journalKey]:{phase:'done',outcome,apiMs},...reservation(apiStartedAt)});
   return this.result(outcome,apiMs);
  }
  private result(value:unknown,apiMs?:number,status=200):Response {
