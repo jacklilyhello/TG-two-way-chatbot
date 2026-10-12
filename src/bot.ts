@@ -4,20 +4,40 @@ import {dueReceiptCleanup,receiptGuardValid} from './receipts';
 import {deliveryRetryGuardValid} from './delivery-retry';
 const allowed = new Set(['getMe','getChat','getChatMember','getUserProfilePhotos','createForumTopic','editForumTopic','sendMessage','sendPhoto','sendMediaGroup','copyMessage','editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','pinChatMessage','unpinChatMessage','setMessageReaction','deleteMessage','answerCallbackQuery','setMyCommands']);
 const nonSending = new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','deleteMessage','unpinChatMessage']);
+const localRateDueHeader='X-Bot-Local-Rate-Due';
+const maxLocalWaitMs=1000;
 interface RequestBody {key:string;method:string;params:Params;guard?:IssueGuard}
 interface Journal {phase:'issued'|'done';outcome?:Outcome;apiMs?:number}
 /** Bot-wide serialization, durable result journal and conservative shared-chat limits. */
 export class BotCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
- fetch(request:Request):Promise<Response> {
-  const queuedAt=Date.now();
-  const result=this.tail.then(async()=>{
-   const startedAt=Date.now();
-   const response=await (new URL(request.url).pathname==='/journal'?this.journal(request):this.execute(request));
-   response.headers.set('X-Bot-Wait-Ms',String(Math.max(0,startedAt-queuedAt)));
-   return response;
-  });this.tail=result.catch(()=>{});return result;
+ async fetch(request:Request):Promise<Response> {
+  let queuedMs=0,localWaitMs=0,scheduledMs=0,waits=0;
+  for(;;) {
+   const queuedAt=Date.now();
+   const result=this.tail.then(async()=>{
+    queuedMs+=Math.max(0,Date.now()-queuedAt);
+    const attempt=request.clone();
+    return new URL(attempt.url).pathname==='/journal'?this.journal(attempt):this.execute(attempt);
+   });
+   this.tail=result.catch(()=>{});
+   const response=await result;
+   const localDue=response.headers.get(localRateDueHeader);
+   response.headers.delete(localRateDueHeader);
+   const delay=localDue===null?NaN:Math.max(0,Number(localDue)-Date.now());
+   if(!Number.isFinite(delay)||scheduledMs+delay>maxLocalWaitMs||waits>=4) {
+    response.headers.set('X-Bot-Wait-Ms',String(queuedMs+localWaitMs));
+    return response;
+   }
+   // Only explicit local rate deadlines reach here. Release the execution
+   // tail while waiting, then re-enter through journal and all final guards.
+   // Bound scheduled time and attempts even if a clock fails to advance.
+   scheduledMs+=delay;waits++;
+   const waitStarted=Date.now();
+   if(delay>0)await new Promise<void>(resolve=>setTimeout(resolve,delay));
+   localWaitMs+=Math.max(0,Date.now()-waitStarted);
+  }
  }
  /** Maintenance reads share the execution tail, so an active request finishes
   * before it can be reconciled. This route never invokes Telegram. */
@@ -53,7 +73,8 @@ export class BotCoordinator {
   const backoffAt=await this.state.storage.get<number>('rate:backoff')??0;
   const chatAt=chat?await this.state.storage.get<number>(chatRateKey)??0:0;
   const due=exempt?backoffAt:Math.max(globalAt,chatAt,backoffAt);
-  if(Date.now()<due) return Response.json({due},{status:429});
+  const rateCheckedAt=Date.now();
+  if(rateCheckedAt<due) return Response.json({due},{status:429,headers:!exempt&&backoffAt<=rateCheckedAt&&due-rateCheckedAt<=maxLocalWaitMs?{[localRateDueHeader]:String(due)}:{}});
   const checks:D1PreparedStatement[]=[];
   const hiddenIndex=guard?.messageIds?.length?checks.push(this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds))-1:-1;
   const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
