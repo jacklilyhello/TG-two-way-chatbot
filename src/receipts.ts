@@ -37,7 +37,7 @@ function jobStatement(e: Env, receipt: Receipt, action: ReceiptJob['action'], at
 
 /** Persist marker intent separately from content delivery. Each original has
  * its own lane: a future ten-second cleanup cannot hold up any business FIFO. */
-export async function syncReceipt(e: Env, rowId: number, clearUntracked = false): Promise<void> {
+export async function syncReceipt(e: Env, rowId: number, clearUntracked = false, waitUntil?:(promise:Promise<unknown>)=>void): Promise<void> {
   const state = await currentState(e, rowId);
   if (!state) return;
   const previous = await one<Receipt>(e, 'SELECT * FROM receipts WHERE admin_id=?', state.anchor.admin_id);
@@ -51,7 +51,10 @@ export async function syncReceipt(e: Env, rowId: number, clearUntracked = false)
     stmt(e, "UPDATE jobs SET state='done' WHERE user_key=? AND kind='reaction' AND state IN ('pending','retry','running') AND (epoch!=? OR json_extract(payload,'$.version')!=(SELECT version FROM receipts WHERE admin_id=?))", `receipt:${state.anchor.admin_id}`,e.RECOVERY_EPOCH,state.anchor.admin_id),
     stmt(e, "INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT 'receipt:'||admin_id||':'||version||':apply:1','receipt:'||admin_id,'reaction',json_object('adminId',admin_id,'version',version,'action','apply','attempt',1),'pending',?,?,? FROM receipts WHERE admin_id=? AND phase='pending'", now(),e.RECOVERY_EPOCH,now(),state.anchor.admin_id),
   ]);
-  await wakeWork(e, `receipt:${state.anchor.admin_id}`);
+  // Only detach hints after durable intent is committed. Business coordinators
+  // can keep them alive without waiting; Queue/Alarm/Cron retain recovery.
+  const wake = wakeWork(e, `receipt:${state.anchor.admin_id}`);
+  if (waitUntil) waitUntil(wake); else await wake;
 }
 
 async function confirmedDelivery(e: Env, row: MessageRow): Promise<boolean> {

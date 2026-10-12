@@ -8,6 +8,7 @@ import {internalForward, admittedBindingMatches, albumMemberBindingMatches} from
 import {bindRetryNotice, deliveryRetryButton, latestDelivery, type DeliveryAttempt} from './delivery-retry';
 export {handleReaction} from './receipts';
 
+type WaitUntil = (promise: Promise<unknown>) => void;
 const CLEAR_LIMIT = 2;
 const CLEAR_BUDGET_MS = 2000;
 const ALBUM_QUIET_MS = 1200;
@@ -36,7 +37,7 @@ async function recordOutcome(e: Env, row: MessageRow, outcome: Outcome, thread: 
   await run(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', status, row.direction === 'in' ? id : null, row.direction === 'out' ? id : null, thread, row.id);
 }
 
-async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome) {
+async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome, waitUntil?: WaitUntil) {
   if (outcome.status === 'success') return;
   if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
   const delivery = await latestDelivery(e,row);
@@ -46,7 +47,8 @@ async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome) {
   const text = outcome.status === 'unknown' ? '发生未知情况：投递结果未知，内容不会自动重发。' : /bot was blocked by the user/i.test(outcome.reason) ? '对方已拉黑机器人' : `未送达，请重试。${outcome.reason ? `原因：${outcome.reason}` : ''}`;
   const noticeKey = `delivery-notice:${row.id}${delivery.attempt?`:attempt:${delivery.attempt.attempt}`:''}`;
   await enqueue(e, `notice:${row.id}`, 'delivery-notice', {rowId:row.id,status:outcome.status,text,opKey}, noticeKey);
-  await wakeWork(e, `notice:${row.id}`);
+  const wake = wakeWork(e, `notice:${row.id}`);
+  if (waitUntil) waitUntil(wake); else await wake;
 }
 
 /** A notification retry must not run the original content job again. */
@@ -65,13 +67,13 @@ export async function handleDeliveryNotice(e: Env, job: Job): Promise<void> {
 
 /** Recover a crash between recording a terminal delivery and queuing its
  * administrator notice. Read the ledger only; no content request is issued. */
-async function restoreDeliveryNotice(e: Env, row: MessageRow) {
+async function restoreDeliveryNotice(e: Env, row: MessageRow, waitUntil?: WaitUntil) {
   if (row.direction !== 'out' || !['failed','unknown'].includes(row.delivery)) return;
   const delivery = await latestDelivery(e,row);
   if (await one(e,'SELECT id FROM jobs WHERE dedupe=?',`delivery-notice:${row.id}${delivery.attempt?`:attempt:${delivery.attempt.attempt}`:''}`)) return;
   const ledger = await one<{phase:string;reason:string|null;code:number|null}>(e,'SELECT phase,reason,code FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${delivery.key}`);
   if (delivery.attempt && ledger?.phase!==row.delivery) return;
-  await deliveryNotice(e,row,{status:row.delivery as 'failed'|'unknown',reason:ledger?.reason??'请查看持久操作记录',code:ledger?.code??undefined});
+  await deliveryNotice(e,row,{status:row.delivery as 'failed'|'unknown',reason:ledger?.reason??'请查看持久操作记录',code:ledger?.code??undefined},waitUntil);
 }
 
 async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<Params> {
@@ -87,7 +89,7 @@ async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<P
   return {reply_parameters: {message_id: targetId, allow_sending_without_reply: true}};
 }
 
-async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?:DeliveryAttempt) {
+async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?:DeliveryAttempt, waitUntil?: WaitUntil) {
   const current = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
   if (!current || current.tombstone || current.deletion !== 'none') return;
   const chatId = row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid;
@@ -117,13 +119,13 @@ async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?
   if (outcome.status === 'success' && id === null) outcome = {status: 'unknown', reason: 'Telegram 返回缺少有效消息 ID'};
   await recordOutcome(e, row, outcome, targetThread, id);
   if (retry) await run(e,'UPDATE delivery_attempts SET state=? WHERE message_id=? AND attempt=?',outcome.status==='failed'&&outcome.reason==='cancelled_by_state'?'suppressed':outcome.status,row.id,retry.attempt);
-  if (row.direction === 'out') await syncReceipt(e, row.id);
-  await deliveryNotice(e, {...row, thread_id: targetThread}, outcome);
+  if (row.direction === 'out') await syncReceipt(e, row.id, false, waitUntil);
+  await deliveryNotice(e, {...row, thread_id: targetThread}, outcome, waitUntil);
 }
 
 /** The new attempt runs in the same user's ordered business lane. A stale
  * reservation can recover its journal, but final guards forbid a new send. */
-export async function handleDeliveryRetry(e:Env,job:Job):Promise<void> {
+export async function handleDeliveryRetry(e:Env,job:Job,waitUntil?:WaitUntil):Promise<void> {
   const p = JSON.parse(job.payload) as {rowId:number;attempt:number};
   const attempt = await one<DeliveryAttempt>(e,'SELECT * FROM delivery_attempts WHERE message_id=? AND attempt=? AND epoch=?',p.rowId,p.attempt,e.RECOVERY_EPOCH);
   const row = attempt ? await one<MessageRow>(e,'SELECT * FROM messages WHERE id=?',attempt.message_id) : null;
@@ -139,28 +141,28 @@ export async function handleDeliveryRetry(e:Env,job:Job):Promise<void> {
   }
   const u = await user(e,row.user_id);
   if (!u) return;
-  await copyOne(e,row,JSON.parse(row.payload) as TGMessage,u,attempt);
+  await copyOne(e,row,JSON.parse(row.payload) as TGMessage,u,attempt,waitUntil);
 }
 
-async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: string) {
+async function albumStatus(e: Env, row: MessageRow, deleting: boolean, scope: string, waitUntil?: WaitUntil) {
   const rows = await all<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? ORDER BY source_id', row.user_id, row.direction, row.source_chat, row.media_group);
   const anchor = rows.find(r => r.admin_id !== null);
   if (!anchor?.admin_id || !rows.length) return;
-  if (!deleting) for (const member of rows) await restoreDeliveryNotice(e,member);
+  if (!deleting) for (const member of rows) await restoreDeliveryNotice(e,member,waitUntil);
   const success = rows.filter(r => deleting ? r.deletion === 'deleted' : r.delivery === 'success').length;
   const pending = rows.some(r => deleting ? r.deletion === 'none' : r.delivery === 'pending');
   if (success === rows.length) {
-    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id);
+    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, false, waitUntil);
   } else if (!pending || deleting) {
     // Incoming albums never receive a delivery marker. Outgoing albums may
     // retain a legacy successful mark from before receipt tracking existed.
-    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, deleting && row.direction === 'out');
+    if (deleting || row.direction === 'out') await syncReceipt(e, anchor.id, deleting && row.direction === 'out', waitUntil);
     const unknown = rows.filter(r => deleting ? r.deletion === 'unknown' : r.delivery === 'unknown').length;
     await notify(e, `${scope}:album-summary:${success}:${unknown}:${rows.length}`, anchor.thread_id, `相册${deleting ? '删除' : '投递'}：已确认${success}/${rows.length}，未知${unknown}，其余${rows.length - success - unknown}。${deleting ? '仅处理选定条目，群内原件和历史保留。' : ''}`);
   }
 }
 
-async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow) {
+async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow, waitUntil?: WaitUntil) {
   const key = groupKey(m);
   await run(e, 'INSERT OR IGNORE INTO media_groups(group_key,user_id,direction,due_at) VALUES(?,?,?,?)', key, u.tgid, row.direction, row.received_at + ALBUM_QUIET_MS);
   const group = await one<{due_at: number}>(e, 'SELECT due_at FROM media_groups WHERE group_key=?', key);
@@ -178,14 +180,14 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
     }
   }
   if (!members.length) {
-    await albumStatus(e, row, false, `album:${key}`);
+    await albumStatus(e, row, false, `album:${key}`, waitUntil);
     return;
   }
   const mediaItems = members.map(r => media(JSON.parse(r.payload) as TGMessage));
   const types = mediaItems.map(x => x?.type);
   const compatible = mediaItems.every(x => x !== null) && (types.every(t => t === 'photo' || t === 'video') || types.every(t => t === 'audio') || types.every(t => t === 'document'));
   if (members.length < 2 || !compatible) {
-    for (const member of members) await copyOne(e, member, JSON.parse(member.payload) as TGMessage, u);
+    for (const member of members) await copyOne(e, member, JSON.parse(member.payload) as TGMessage, u, undefined, waitUntil);
   } else {
     const batchKey = savedBatch?.batch_key ?? `album-send:${key}:${members.map(r => r.id).join(',')}`;
     const targetThread = savedBatch?.thread_id ?? u.thread_id;
@@ -203,12 +205,12 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
       ...members.map((member, i) => stmt(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', outcome.status === 'failed' && outcome.reason === 'cancelled_by_state' ? 'suppressed' : outcome.status, row.direction === 'in' && outcome.status === 'success' ? ids[i] : null, row.direction === 'out' && outcome.status === 'success' ? ids[i] : null, targetThread, member.id)),
       stmt(e, "UPDATE media_batches SET state='done' WHERE batch_key=?", batchKey),
     ]);
-    if (row.direction === 'out') await syncReceipt(e, row.id);
+    if (row.direction === 'out') await syncReceipt(e, row.id, false, waitUntil);
     for (let i = 0; i < members.length; i++) {
-      await deliveryNotice(e, {...members[i], thread_id: targetThread}, outcome);
+      await deliveryNotice(e, {...members[i], thread_id: targetThread}, outcome, waitUntil);
     }
   }
-  await albumStatus(e, row, false, `album:${key}`);
+  await albumStatus(e, row, false, `album:${key}`, waitUntil);
 }
 
 async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: UserRow) {
@@ -304,12 +306,12 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
   if (m.media_group_id) {
     row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?', row.id);
     if (!row || row.tombstone || row.deletion !== 'none') return;
-    await album(e, job, row, m, u); return;
+    await album(e, job, row, m, u, waitUntil); return;
   }
   // copyOne rechecks the current row before preparing its request. Album
   // batches and terminal receipt recovery retain their own state reads.
-  if (row.delivery === 'pending') await copyOne(e, row, m, u);
-  else if (row.direction === 'out') {await syncReceipt(e, row.id);await restoreDeliveryNotice(e,row);}
+  if (row.delivery === 'pending') await copyOne(e, row, m, u, undefined, waitUntil);
+  else if (row.direction === 'out') {await syncReceipt(e, row.id, false, waitUntil);await restoreDeliveryNotice(e,row,waitUntil);}
 }
 
 async function recoverPrivateTarget(e: Env, row: MessageRow): Promise<void> {

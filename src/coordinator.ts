@@ -88,7 +88,7 @@ export async function execute(e:Env,j:Job,waitUntil?:(promise:Promise<unknown>)=
  const p=JSON.parse(j.payload);
  if(j.kind==='card'){await handleCard(e,j);return;}
  if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j);return;}
- if(j.kind==='delivery-retry'){await handleDeliveryRetry(e,j);return;}
+ if(j.kind==='delivery-retry'){await handleDeliveryRetry(e,j,waitUntil);return;}
  if(j.kind==='reaction'){await handleReaction(e,j);return;}
  if(j.kind==='bootstrap'){await bootstrap(e,j);return;}
  if(j.kind==='logs') {await flushLogs(e,j);return;}
