@@ -57,7 +57,7 @@ export function renderWrangler(config, databaseId, version, base = {}) {
     queues: { producers: [{ binding: 'JOBS', queue: config.queue_name }], consumers: [{ queue: config.queue_name, max_batch_size: 10, max_batch_timeout: 1, max_retries: 3, dead_letter_queue: config.dlq_name }] },
     durable_objects: { bindings: [{ name: 'CONVERSATIONS', class_name: 'ConversationCoordinator' }, { name: 'BOT', class_name: 'BotCoordinator' }] },
     migrations: base.migrations ?? [{ tag: 'v1', new_sqlite_classes: ['ConversationCoordinator', 'BotCoordinator'] }],
-    triggers: { crons: ['* * * * *'] }, observability: { enabled: true, head_sampling_rate: 0.1 },
+    triggers: { crons: ['* * * * *'] }, observability: { enabled: true, head_sampling_rate: 1 },
   };
 }
 

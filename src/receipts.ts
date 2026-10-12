@@ -122,11 +122,11 @@ export async function dueReceiptCleanup(e:Env,time:number):Promise<boolean> {
 
 /** Marker-only retries may converge an unknown reaction to the same desired
  * state, with a fresh version guard. They never replay a content operation. */
-export async function handleReaction(e: Env, job: Job): Promise<void> {
+export async function handleReaction(e: Env, job: Job,waitUntil?:(promise:Promise<unknown>)=>void): Promise<void> {
   const payload = JSON.parse(job.payload) as Partial<ReceiptJob> & {rowId?: number};
   // Pending jobs created before this migration must derive current intent,
   // never blindly apply their saved emoji.
-  if (payload.rowId) {await syncReceipt(e, payload.rowId, true); return;}
+  if (payload.rowId) {await syncReceipt(e, payload.rowId, true,waitUntil); return;}
   const p = payload as ReceiptJob;
   if (!Number.isSafeInteger(p.adminId) || !Number.isSafeInteger(p.version) || !Number.isInteger(p.attempt) || p.attempt < 1 || p.attempt > 3 || !['apply','clear'].includes(p.action)) return;
   const receipt = await one<Receipt>(e, 'SELECT * FROM receipts WHERE admin_id=?', p.adminId);
@@ -134,10 +134,10 @@ export async function handleReaction(e: Env, job: Job): Promise<void> {
   if (p.action === 'apply' && receipt.phase !== 'pending' || p.action === 'clear' && receipt.phase !== 'visible') return;
   if (p.action === 'clear' && receipt.clear_after !== null && receipt.clear_after > now()) throw new RetryLater(receipt.clear_after);
   const guard: ReceiptGuard = {adminId: receipt.admin_id, version: receipt.version, signature: receipt.signature, emoji: receipt.emoji, clear: p.action === 'clear'};
-  if (!await receiptGuardValid(e, guard)) {await syncReceipt(e, receipt.row_id); return;}
+  if (!await receiptGuardValid(e, guard)) {await syncReceipt(e, receipt.row_id,false,waitUntil); return;}
   const emoji = p.action === 'clear' ? null : receipt.emoji;
   const outcome = await call(e, `receipt:${p.adminId}:${p.version}:${p.action}:${p.attempt}`, 'setMessageReaction', {chat_id: e.ADMIN_CHAT_ID,message_id: p.adminId,reaction: emoji ? [{type: 'emoji',emoji}] : []}, {receipt: guard});
-  if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') {await syncReceipt(e, receipt.row_id); return;}
+  if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') {await syncReceipt(e, receipt.row_id,false,waitUntil); return;}
   const success = outcome.status === 'success' && outcome.result === true;
   const status = outcome.status === 'success' && !success ? 'unknown' : outcome.status;
   const confirmedAt = success ? outcome.confirmedAt ?? now() : null;
@@ -152,5 +152,5 @@ export async function handleReaction(e: Env, job: Job): Promise<void> {
     if (p.attempt < 3) statements.push(jobStatement(e, receipt, p.action, p.attempt + 1, now() + 3000 * 2 ** (p.attempt - 1)));
   }
   await e.DB.batch(statements);
-  if (!success) await audit(e, 'reaction_exception', {message: receipt.row_id,version: p.version,action: p.action,attempt: p.attempt,status,...(outcome.status !== 'success' ? {code: outcome.code} : {})});
+  if (!success) await audit(e, 'reaction_exception', {message: receipt.row_id,version: p.version,action: p.action,attempt: p.attempt,status,...(outcome.status !== 'success' ? {code: outcome.code} : {})},waitUntil);
 }

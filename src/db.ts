@@ -56,11 +56,17 @@ export async function scheduleLogs(e: Env) {
  const results=await e.DB.batch([...logEpochStatements(e),...logOutboxStatements(e)]);
  return results.some(result=>result.meta.changes>0);
 }
-export async function audit(e: Env, event: string, detail: Params = {}) {
+export async function audit(e: Env, event: string, detail: Params = {}, waitUntil?:(promise:Promise<unknown>)=>void) {
  const time=now();
  const epochGate=logEpochStatements(e);
  const results=await e.DB.batch([...epochGate,stmt(e,'INSERT INTO audit_logs(event,detail,created_at) VALUES(?,?,?)',event,JSON.stringify(detail),time),...logOutboxStatements(e,time)]);
- if(results.slice(epochGate.length+1).some(result=>result.meta.changes>0))await wakeLogs(e);
+ if(results.slice(epochGate.length+1).some(result=>result.meta.changes>0)) {
+  // The audit and its outbox must commit before detaching notification hints.
+  // A slow Queue/Alarm hint cannot hold a business lane when its coordinator
+  // supplies a lifetime; callers without one still await the wake safely.
+  const wake=wakeLogs(e);
+  if(waitUntil)waitUntil(wake);else await wake;
+ }
 }
 const nextJobStatement=(e:Env,key:string)=>stmt(e,"SELECT * FROM jobs WHERE user_key=? AND state IN ('pending','retry','running') AND epoch=? ORDER BY CASE WHEN user_key='system' AND kind='bootstrap' THEN 0 ELSE 1 END,id LIMIT 1",key,e.RECOVERY_EPOCH);
 export async function nextJob(e: Env, key: string) {return nextJobStatement(e,key).first<Job>();}

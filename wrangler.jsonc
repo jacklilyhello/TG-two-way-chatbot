@@ -11,5 +11,5 @@
   "durable_objects":{"bindings":[{"name":"CONVERSATIONS","class_name":"ConversationCoordinator"},{"name":"BOT","class_name":"BotCoordinator"}]},
   "migrations":[{"tag":"v1","new_sqlite_classes":["ConversationCoordinator","BotCoordinator"]}],
   "triggers":{"crons":["* * * * *"]},
-  "observability":{"enabled":true,"head_sampling_rate":0.1}
+  "observability":{"enabled":true,"head_sampling_rate":1}
 }

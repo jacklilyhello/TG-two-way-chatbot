@@ -44,7 +44,20 @@ export default {
     return Response.json({ok:true,version:e.VERSION,epoch:e.RECOVERY_EPOCH,paused:e.PAUSED==='true'||await setting(e,'paused')==='1',jobs:counts,issued:issued?.n??0});
    }
    if(!validUpdate(body))return new Response('Invalid update',{status:400});
-   const key=await accept(e,body as TGUpdate);
+   const update=body as TGUpdate,started=now();
+   const message=update.message??update.edited_message;
+   // Correlate authenticated ingress with its durable outcome without logging
+   // identities, content, media identifiers, credentials or exception text.
+   const observation={event:'webhook_commit',version:e.VERSION,update_id:update.update_id,
+    kind:update.message?'message':update.edited_message?'edited_message':update.callback_query?'callback_query':'other',
+    media:message?.photo?'photo':message?.video?'video':message?.audio?'audio':message?.voice?'voice':message?.document?'document':message?.sticker?'sticker':message?.text?'text':'other',
+    album:!!message?.media_group_id};
+   console.info({...observation,phase:'received',at:started});
+   let key:string;
+   try {key=await accept(e,update);}
+   catch {const failed=now();console.info({...observation,phase:'failed',at:failed,elapsed_ms:Math.max(0,failed-started)});throw new Error('Ingress commit failed');}
+   const committed=now();
+   console.info({...observation,phase:'committed',at:committed,elapsed_ms:Math.max(0,committed-started)});
    // The durable commit precedes both independent wake hints. Keep the
    // Webhook response separate from potentially long conversation draining.
    ctx?.waitUntil(armWork(e,key).catch(()=>{}));

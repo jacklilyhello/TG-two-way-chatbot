@@ -74,7 +74,7 @@ export class ConversationCoordinator {
     const delay=error instanceof RetryLater?error.due:now()+Math.min(60000,1000*2**Math.min(job.attempts,6));
     if(!(error instanceof RetryLater)&&job.attempts>=8) {
      await run(this.env,"UPDATE jobs SET state='attention',error='执行中断；需要检查持久操作记录',execution_ms=execution_ms+? WHERE id=?",Math.max(0,now()-started),job.id);
-     await audit(this.env,'任务需要处理',{job:job.id});
+     await audit(this.env,'任务需要处理',{job:job.id},promise=>this.state.waitUntil(promise));
     } else {
      await run(this.env,"UPDATE jobs SET state='retry',due_at=?,error=?,execution_ms=execution_ms+? WHERE id=?",delay,error instanceof RetryLater?'限流或依赖延迟':'执行中断；已保存恢复状态',Math.max(0,now()-started),job.id);
      await this.state.storage.setAlarm(delay);return;
@@ -87,12 +87,12 @@ export class ConversationCoordinator {
 export async function execute(e:Env,j:Job,waitUntil?:(promise:Promise<unknown>)=>void) {
  const p=JSON.parse(j.payload);
  if(j.kind==='card'){await handleCard(e,j);return;}
- if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j);return;}
+ if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j,waitUntil);return;}
  if(j.kind==='delivery-retry'){await handleDeliveryRetry(e,j,waitUntil);return;}
- if(j.kind==='reaction'){await handleReaction(e,j);return;}
+ if(j.kind==='reaction'){await handleReaction(e,j,waitUntil);return;}
  if(j.kind==='bootstrap'){await bootstrap(e,j);return;}
  if(j.kind==='logs') {await flushLogs(e,j);return;}
- if(j.kind==='clear') {const u=await user(e,j.user_key);if(u)await clearConversation(e,j,u,p.batchId);return;}
+ if(j.kind==='clear') {const u=await user(e,j.user_key);if(u)await clearConversation(e,j,u,p.batchId,waitUntil);return;}
  const update=p.update as TGUpdate;
  if(!update)return;
  if(await handleAdmin(e,j,update,waitUntil))return;
