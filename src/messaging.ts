@@ -1,10 +1,10 @@
 import type {Env, Job, MessageRow, Params, TGMessage, TGUpdate, UserRow} from './types';
 import {all, audit, enqueue, now, one, run, setting, stmt, user, wakeWork} from './db';
-import {call, notify, RetryLater, type Outcome} from './operations';
+import {call, notify, RetryLater, type IssueGuard, type Outcome} from './operations';
 import {ensureThread, ensureUser, scheduleCard} from './admin';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {syncReceipt} from './receipts';
-import {internalForward, admittedBindingMatches, albumMemberBindingMatches} from './security';
+import {internalForward, admittedBindingMatches, albumMemberBindingMatches,privateAdmissionMatches} from './security';
 import {bindRetryNotice, deliveryRetryButton, latestDelivery, type DeliveryAttempt} from './delivery-retry';
 export {handleReaction} from './receipts';
 
@@ -42,7 +42,7 @@ async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome, waitUnt
   if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
   const delivery = await latestDelivery(e,row);
   const opKey = `${e.RECOVERY_EPOCH}:${delivery.key}`;
-  if (!await one(e, "SELECT id FROM audit_logs WHERE event=? AND json_extract(detail,'$.message')=? AND (json_extract(detail,'$.opKey')=? OR (?=0 AND json_extract(detail,'$.opKey') IS NULL)) LIMIT 1",`delivery_${outcome.status}`,row.id,opKey,delivery.attempt?.attempt??0)) await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason,opKey});
+  if (!await one(e, "SELECT id FROM audit_logs WHERE event=? AND json_extract(detail,'$.message')=? AND (json_extract(detail,'$.opKey')=? OR (?=0 AND json_extract(detail,'$.opKey') IS NULL)) LIMIT 1",`delivery_${outcome.status}`,row.id,opKey,delivery.attempt?.attempt??0)) await audit(e, `delivery_${outcome.status}`, {message: row.id, direction: row.direction, code: outcome.code, reason: outcome.reason,opKey},waitUntil);
   if (row.direction !== 'out') return;
   const text = outcome.status === 'unknown' ? '发生未知情况：投递结果未知，内容不会自动重发。' : /bot was blocked by the user/i.test(outcome.reason) ? '对方已拉黑机器人' : `未送达，请重试。${outcome.reason ? `原因：${outcome.reason}` : ''}`;
   const noticeKey = `delivery-notice:${row.id}${delivery.attempt?`:attempt:${delivery.attempt.attempt}`:''}`;
@@ -52,7 +52,7 @@ async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome, waitUnt
 }
 
 /** A notification retry must not run the original content job again. */
-export async function handleDeliveryNotice(e: Env, job: Job): Promise<void> {
+export async function handleDeliveryNotice(e: Env, job: Job,waitUntil?:WaitUntil): Promise<void> {
   const p = JSON.parse(job.payload) as {rowId:number;status:string;text:string;opKey?:string};
   const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=?',p.rowId);
   if (!row || row.direction !== 'out' || row.epoch !== e.RECOVERY_EPOCH || row.delivery !== p.status || !['failed','unknown'].includes(p.status) || typeof p.text !== 'string') return;
@@ -62,7 +62,7 @@ export async function handleDeliveryNotice(e: Env, job: Job): Promise<void> {
   const button = p.status==='failed' ? await deliveryRetryButton(e,row) : null;
   const outcome = await notify(e, job.dedupe, row.thread_id, p.text,button?{reply_markup:button.reply_markup}:{});
   if (button && outcome.status==='success') await bindRetryNotice(e,button.token,knownMessageId(outcome.result)??0);
-  if (outcome.status !== 'success') await audit(e, 'delivery_notice_exception', {message:row.id,status:outcome.status,code:outcome.code});
+  if (outcome.status !== 'success') await audit(e, 'delivery_notice_exception', {message:row.id,status:outcome.status,code:outcome.code},waitUntil);
 }
 
 /** Recover a crash between recording a terminal delivery and queuing its
@@ -76,7 +76,7 @@ async function restoreDeliveryNotice(e: Env, row: MessageRow, waitUntil?: WaitUn
   await deliveryNotice(e,row,{status:row.delivery as 'failed'|'unknown',reason:ledger?.reason??'请查看持久操作记录',code:ledger?.code??undefined},waitUntil);
 }
 
-async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<Params> {
+async function replyParameters(e: Env, row: MessageRow, m: TGMessage,waitUntil?:WaitUntil): Promise<Params> {
   if (!m.reply_to_message) return {};
   if (String(m.reply_to_message.chat.id) !== row.source_chat) return {};
   // Telegram attaches the topic-created service root to ordinary forum
@@ -86,7 +86,7 @@ async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<P
   const target = await one<MessageRow>(e, `SELECT * FROM messages WHERE user_id=? AND ${column}=? ORDER BY id DESC LIMIT 1`, row.user_id, m.reply_to_message.message_id);
   const targetId = row.direction === 'in' ? target?.admin_id : target?.private_id;
   if (!target || !targetId || target.tombstone || target.deletion !== 'none' || target.thread_id !== row.thread_id) {
-    await audit(e, 'reply_fallback', {message: row.id, reason: '映射缺失、目标已删除或不属于当前话题'});
+    await audit(e, 'reply_fallback', {message: row.id, reason: '映射缺失、目标已删除或不属于当前话题'},waitUntil);
     return {};
   }
   return {reply_parameters: {message_id: targetId, allow_sending_without_reply: true}};
@@ -102,8 +102,8 @@ async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?
   if (row.thread_id === null) await run(e, 'UPDATE messages SET thread_id=? WHERE id=?', targetThread, row.id);
   const params: Params = {chat_id: chatId, from_chat_id: row.source_chat, message_id: row.source_id};
   if (row.direction === 'in') params.message_thread_id = targetThread;
-  Object.assign(params, await replyParameters(e, {...row, thread_id: targetThread}, m));
-  const guard = {messageIds: [row.id], threadVersion: {userId: u.tgid, version: retry?.binding_version??u.binding_version, threadId: targetThread ?? undefined},...(retry?{deliveryRetry:{messageId:row.id,attempt:retry.attempt,actorId:retry.actor_id,userId:retry.user_id,threadId:retry.thread_id,bindingVersion:retry.binding_version,priorOpKey:retry.prior_op_key}}:{})};
+  Object.assign(params, await replyParameters(e, {...row, thread_id: targetThread}, m,waitUntil));
+  const guard = {messageIds: [row.id], threadVersion: {userId: u.tgid, version: retry?.binding_version??u.binding_version, threadId: targetThread ?? undefined},...(row.direction==='in'?{unblockedUser:u.tgid}:{}),...(retry?{deliveryRetry:{messageId:row.id,attempt:retry.attempt,actorId:retry.actor_id,userId:retry.user_id,threadId:retry.thread_id,bindingVersion:retry.binding_version,priorOpKey:retry.prior_op_key}}:{})};
   const baseKey = retry?.op_key??`send:${row.id}`;
   // A previously issued no-reply fallback remains the authoritative attempt
   // even if the quoted target disappeared before this job resumed.
@@ -115,7 +115,7 @@ async function copyOne(e: Env, row: MessageRow, m: TGMessage, u: UserRow, retry?
   // this request, so a single fallback without a reply cannot duplicate delivery.
   if (outcome.status === 'failed' && /reply.*(?:not found|deleted)|message to be replied not found/i.test(outcome.reason) && params.reply_parameters) {
     delete params.reply_parameters;
-    await audit(e, 'reply_fallback', {message: row.id, reason: 'Telegram 拒绝引用目标'});
+    await audit(e, 'reply_fallback', {message: row.id, reason: 'Telegram 拒绝引用目标'},waitUntil);
     outcome = await call(e, `${baseKey}:without-reply`, 'copyMessage', params, guard);
   }
   const id = outcome.status === 'success' ? knownMessageId(outcome.result) : null;
@@ -173,7 +173,7 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
   const savedBatch = await one<{batch_key: string; members: string; thread_id: number | null}>(e, "SELECT batch_key,members,thread_id FROM media_batches WHERE group_key=? AND state='pending' ORDER BY rowid LIMIT 1", key);
   let members = savedBatch ? await all<MessageRow>(e, 'SELECT * FROM messages WHERE id IN (SELECT value FROM json_each(?)) ORDER BY source_id', savedBatch.members) : await all<MessageRow>(e, "SELECT * FROM messages WHERE user_id=? AND direction=? AND source_chat=? AND media_group=? AND delivery='pending' AND tombstone=0 AND deletion='none' ORDER BY source_id LIMIT 10", u.tgid, row.direction, row.source_chat, m.media_group_id);
   let admitted = true;
-  if (row.direction === 'out') {
+  {
     const matches = await Promise.all(members.map(member => albumMemberBindingMatches(e, member, u)));
     admitted = matches.every(Boolean);
     if (!savedBatch) {
@@ -197,11 +197,11 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
     if (!savedBatch) await run(e, 'INSERT OR IGNORE INTO media_batches(batch_key,group_key,members,thread_id) VALUES(?,?,?,?)', batchKey, key, JSON.stringify(members.map(r => r.id)), targetThread);
     const params: Params = {chat_id: row.direction === 'in' ? e.ADMIN_CHAT_ID : u.tgid, media: mediaItems};
     if (row.direction === 'in') params.message_thread_id = targetThread;
-    Object.assign(params, await replyParameters(e, {...members[0], thread_id: targetThread}, JSON.parse(members[0].payload) as TGMessage));
+    Object.assign(params, await replyParameters(e, {...members[0], thread_id: targetThread}, JSON.parse(members[0].payload) as TGMessage,waitUntil));
     // A frozen batch must keep its original membership for journal recovery.
     // An invalid admission version forbids new side effects, while call() and
     // the Bot journal can still return an already confirmed batch mapping.
-    let outcome = await call(e, batchKey, 'sendMediaGroup', params, {messageIds: members.map(r => r.id), threadVersion: {userId: u.tgid, version: admitted ? u.binding_version : -1, threadId: targetThread ?? undefined}});
+    let outcome = await call(e, batchKey, 'sendMediaGroup', params, {messageIds: members.map(r => r.id), threadVersion: {userId: u.tgid, version: admitted ? u.binding_version : -1, threadId: targetThread ?? undefined},...(row.direction==='in'?{unblockedUser:u.tgid}:{})});
     const ids = outcome.status === 'success' && Array.isArray(outcome.result) ? outcome.result.map(knownMessageId) : [];
     if (outcome.status === 'success' && (ids.length !== members.length || ids.some(id => id === null))) outcome = {status: 'unknown', reason: '相册返回数量或消息 ID 无法对应，禁止猜测映射或重发'};
     await e.DB.batch([
@@ -216,7 +216,7 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
   await albumStatus(e, row, false, `album:${key}`, waitUntil);
 }
 
-async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: UserRow) {
+async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: UserRow,waitUntil?:WaitUntil) {
   if (!row || row.delivery === 'pending') {
     await run(e, "UPDATE jobs SET state='waiting',due_at=? WHERE id=?", now() + 1000, job.id);
     return;
@@ -235,18 +235,18 @@ async function edit(e: Env, job: Job, row: MessageRow | null, m: TGMessage, u: U
     const inputMedia = media(m);
     if (inputMedia) {method = 'editMessageMedia'; params.media = inputMedia;}
     else if (m.caption !== undefined) {method = 'editMessageCaption'; params.caption = m.caption; if (m.caption_entities) params.caption_entities = m.caption_entities;}
-    else {await audit(e, 'edit_unsupported', {message: row.id}); await notify(e, `edit:${row.id}:${updateId}:unsupported`, row.thread_id, '该消息类型不支持编辑同步；保留已有副本。'); return;}
+    else {await audit(e, 'edit_unsupported', {message: row.id},waitUntil); await notify(e, `edit:${row.id}:${updateId}:unsupported`, row.thread_id, '该消息类型不支持编辑同步；保留已有副本。'); return;}
   }
-  const outcome = await call(e, `edit:${row.id}:${updateId}`, method, params, {messageIds: [row.id], threadVersion: {userId: u.tgid, version: u.binding_version, threadId: row.thread_id ?? undefined}});
+  const outcome = await call(e, `edit:${row.id}:${updateId}`, method, params, {messageIds: [row.id], threadVersion: {userId: u.tgid, version: u.binding_version, threadId: row.thread_id ?? undefined},...(row.direction==='in'?{unblockedUser:u.tgid}:{})});
   if (outcome.status === 'failed' && outcome.reason === 'cancelled_by_state') return;
   if (outcome.status === 'failed' && /message is not modified/i.test(outcome.reason)) return;
   if (outcome.status !== 'success') {
-    await audit(e, `edit_${outcome.status}`, {message: row.id, code: outcome.code});
+    await audit(e, `edit_${outcome.status}`, {message: row.id, code: outcome.code},waitUntil);
     await notify(e, `edit:${row.id}:${updateId}:notice`, row.thread_id, outcome.status === 'unknown' ? '发生未知情况：编辑同步结果未知，不会重发原消息。' : `编辑未同步：${outcome.reason}`);
   }
 }
 
-async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string) {
+async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string,waitUntil?:WaitUntil) {
   const template = await setting(e, command === 'start' ? 'start_text' : 'help_text', DEFAULT_FIXED_TEXT[command === 'start' ? 'start' : 'help']);
   const name = [m.from?.first_name, m.from?.last_name].filter(Boolean).join(' ') || row.user_id;
   const text = template.replace(/\{(?:name|first_name|last_name|username|tgid)\}/g, token => ({'{name}': name, '{first_name}': m.from?.first_name ?? '', '{last_name}': m.from?.last_name ?? '', '{username}': m.from?.username ? `@${m.from.username}` : '未设置', '{tgid}': row.user_id}[token] ?? token));
@@ -259,12 +259,12 @@ async function fixedReply(e: Env, row: MessageRow, m: TGMessage, command: string
   ]);
   const reply = await one<MessageRow>(e, 'SELECT * FROM messages WHERE source_chat=? AND source_id=?', row.user_id, -row.id);
   if (!reply || reply.tombstone) return;
-  const outcome = await call(e, `fixed:${row.id}`, 'sendMessage', {chat_id: row.user_id, text}, {messageIds: [row.id, reply.id]});
+  const outcome = await call(e, `fixed:${row.id}`, 'sendMessage', {chat_id: row.user_id, text}, {messageIds: [row.id, reply.id],unblockedUser:row.user_id});
   if (outcome.status === 'success') {
     const id = knownMessageId(outcome.result);
     if (id) await run(e, "UPDATE messages SET private_id=?,delivery='success' WHERE id=?", id, reply.id);
-    else {await run(e, "UPDATE messages SET delivery='unknown' WHERE id=?", reply.id); await audit(e, 'fixed_reply_unknown', {message: row.id});}
-  } else {await run(e, 'UPDATE messages SET delivery=? WHERE id=?', outcome.status, reply.id); await audit(e, `fixed_reply_${outcome.status}`, {message: row.id, code: outcome.code});}
+    else {await run(e, "UPDATE messages SET delivery='unknown' WHERE id=?", reply.id); await audit(e, 'fixed_reply_unknown', {message: row.id},waitUntil);}
+  } else {await run(e, 'UPDATE messages SET delivery=? WHERE id=?', outcome.status, reply.id); await audit(e, `fixed_reply_${outcome.status}`, {message: row.id, code: outcome.code},waitUntil);}
   await run(e, "UPDATE messages SET business=0,delivery='ignored' WHERE id=?", row.id);
 }
 
@@ -284,7 +284,11 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     if (row && !edited && row.delivery === 'pending') await run(e, "UPDATE messages SET delivery='blocked' WHERE id=?", row.id);
     return;
   }
-  if (edited) {await edit(e, job, row, m, u); return;}
+  if(privateChat&&!await privateAdmissionMatches(e,job,u)) {
+    if(row&&!edited&&row.delivery==='pending')await run(e,"UPDATE messages SET delivery='suppressed' WHERE id=?",row.id);
+    return;
+  }
+  if (edited) {await edit(e, job, row, m, u,waitUntil); return;}
   if (!row || row.tombstone || row.deletion !== 'none') return;
   if (!privateChat && (!u.thread_id || u.thread_id !== m.message_thread_id || row.thread_id !== u.thread_id)) {
     await run(e, "UPDATE messages SET delivery='suppressed' WHERE id=? AND delivery='pending'", row.id);
@@ -292,18 +296,18 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     return;
   }
   const command = m.text?.match(/^\/(start|help)(?:@[A-Za-z0-9_]+)?(?:\s|$)/)?.[1];
-  if (privateChat && command) {await fixedReply(e, row, m, command); return;}
+  if (privateChat && command) {await fixedReply(e, row, m, command,waitUntil); return;}
   if (m.text?.startsWith('/')) {await run(e, "UPDATE messages SET delivery='ignored',business=0 WHERE id=?", row.id); return;}
   if (!(m.text || m.photo || m.video || m.audio || m.voice || m.document || m.sticker || m.animation)) {
     await run(e, "UPDATE messages SET delivery='ignored',business=0 WHERE id=?", row.id);
-    await audit(e, 'unsupported_message', {message: row.id});
+    await audit(e, 'unsupported_message', {message: row.id},waitUntil);
     return;
   }
   if (privateChat) {
     // ensureUser just returned the current binding. The Bot's final guard
     // rejects a later binding change before any new external side effect.
-    if (!u.thread_id) u = await ensureThread(e, job, u.tgid, false);
-    if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id}); return;}
+    if (!u.thread_id) u = await ensureThread(e, job, u.tgid, false,waitUntil);
+    if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id},waitUntil); return;}
     await scheduleCard(e, job, u, false, waitUntil);
   }
   if (m.media_group_id) {
@@ -335,7 +339,7 @@ async function recoverPrivateTarget(e: Env, row: MessageRow): Promise<void> {
   else if (outcome.status === 'unknown' || outcome.status === 'success') {row.delivery = 'unknown'; await run(e, "UPDATE messages SET delivery='unknown' WHERE id=?", row.id);}
 }
 
-async function deleteRow(e: Env, row: MessageRow, opKey: string): Promise<string> {
+async function deleteRow(e: Env, row: MessageRow, opKey: string,guard?:IssueGuard,waitUntil?:WaitUntil): Promise<string> {
   if (row.deletion === 'deleted' || row.deletion === 'unknown') return row.deletion;
   await run(e, 'UPDATE messages SET tombstone=1 WHERE id=?', row.id);
   await recoverPrivateTarget(e, row);
@@ -344,26 +348,31 @@ async function deleteRow(e: Env, row: MessageRow, opKey: string): Promise<string
     await run(e, 'UPDATE messages SET deletion=? WHERE id=?', result, row.id);
     return result;
   }
-  const outcome = await call(e, opKey, 'deleteMessage', {chat_id: row.user_id, message_id: row.private_id});
+  const outcome = await call(e, opKey, 'deleteMessage', {chat_id: row.user_id, message_id: row.private_id},guard);
+  // A final binding rejection never reached Telegram. Preserve the tombstone:
+  // an ingress-confirmed clear may now own it, so reverting it could revive
+  // content that the independent snapshot has already locked.
+  if(outcome.status==='failed'&&outcome.reason==='cancelled_by_state')return 'cancelled';
   const result = outcome.status === 'success' && outcome.result === true ? 'deleted' : outcome.status === 'unknown' || outcome.status === 'success' ? 'unknown' : /can't be deleted|cannot be deleted|message to delete not found|not enough rights/i.test(outcome.reason) ? 'unavailable' : 'failed';
   await run(e, 'UPDATE messages SET deletion=? WHERE id=?', result, row.id);
-  if (result !== 'deleted') await audit(e, 'deletion_exception', {message: row.id, result, ...(outcome.status !== 'success' ? {code: outcome.code, reason: outcome.reason} : {})});
+  if (result !== 'deleted') await audit(e, 'deletion_exception', {message: row.id, result, ...(outcome.status !== 'success' ? {code: outcome.code, reason: outcome.reason} : {})},waitUntil);
   return result;
 }
 
-export async function deleteSingle(e: Env, job: Job, m: TGMessage, u: UserRow): Promise<void> {
+export async function deleteSingle(e: Env, job: Job, m: TGMessage, u: UserRow,waitUntil?:WaitUntil): Promise<void> {
   if (!authorised(e, m) || m.message_thread_id !== u.thread_id || !m.reply_to_message || !await admittedBindingMatches(e, job, m, u)) return;
   if (String(m.reply_to_message.chat.id) !== e.ADMIN_CHAT_ID || m.reply_to_message.message_thread_id !== undefined && m.reply_to_message.message_thread_id !== u.thread_id) return;
   const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE user_id=? AND admin_id=? AND thread_id=? ORDER BY id DESC LIMIT 1', u.tgid, m.reply_to_message.message_id, u.thread_id);
   if (!row) {await notify(e, `sc:${job.id}:missing`, u.thread_id, '无法删除：新系统没有这条消息的用户端映射。'); return;}
-  const result = await deleteRow(e, row, `delete:${row.id}:${job.id}`);
-  if (row.media_group) await albumStatus(e, row, true, `delete:${job.id}`);
-  else if (result === 'deleted' && row.admin_id) await syncReceipt(e, row.id);
+  const result = await deleteRow(e, row, `delete:${row.id}:${job.id}`,{threadVersion:{userId:u.tgid,version:u.binding_version,threadId:u.thread_id??undefined}},waitUntil);
+  if(result==='cancelled')return;
+  if (row.media_group) await albumStatus(e, row, true, `delete:${job.id}`,waitUntil);
+  else if (result === 'deleted' && row.admin_id) await syncReceipt(e, row.id,false,waitUntil);
   if (result !== 'deleted') await notify(e, `sc:${job.id}:result`, u.thread_id, result === 'unknown' ? '发生未知情况：删除结果未知，未标记为成功。' : result === 'unavailable' ? '未删除：消息不存在、超过限制、权限不足或没有已确认的私聊目标。' : '未删除：Telegram 明确拒绝，请查看异常记录。');
 }
 
 /** Only an ingress-captured, tombstoned snapshot may be cleared. */
-export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: string): Promise<void> {
+export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: string,waitUntil?:WaitUntil): Promise<void> {
   const started = now();
   if (!batchId) return;
   const batch = await one<{user_id: string; state: string}>(e, 'SELECT user_id,state FROM deletion_batches WHERE id=?', batchId);
@@ -372,9 +381,9 @@ export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: 
   let processedThrough: number | undefined;
   for (const item of items) {
     const row = await one<MessageRow>(e, 'SELECT * FROM messages WHERE id=? AND user_id=?', item.message_id, u.tgid);
-    const result = row ? await deleteRow(e, row, `clear:${batchId}:${row.id}`) : 'unavailable';
+    const result = row ? await deleteRow(e, row, `clear:${batchId}:${row.id}`,undefined,waitUntil) : 'unavailable';
     await run(e, 'UPDATE deletion_items SET result=? WHERE batch_id=? AND message_id=?', result, batchId, item.message_id);
-    if (row?.admin_id && !row.media_group && result === 'deleted') await syncReceipt(e, row.id);
+    if (row?.admin_id && !row.media_group && result === 'deleted') await syncReceipt(e, row.id,false,waitUntil);
     processedThrough = item.message_id;
     // Yield only after the external result and this item are durable. Never
     // interrupt an in-flight deletion or reuse the unprocessed selection tail.
@@ -388,7 +397,7 @@ export async function clearConversation(e: Env, job: Job, u: UserRow, batchId?: 
   // Recalculate all affected albums once the batch has a final result, including
   // albums that crossed the bounded continuation between jobs.
   const albumRows = await all<MessageRow>(e, 'SELECT m.* FROM messages m JOIN deletion_items d ON d.message_id=m.id WHERE d.batch_id=? AND m.media_group IS NOT NULL GROUP BY m.source_chat,m.media_group', batchId);
-  for (const row of albumRows) await albumStatus(e, row, true, `clear:${batchId}`);
+  for (const row of albumRows) await albumStatus(e, row, true, `clear:${batchId}`,waitUntil);
   const counts = await all<{result: string; n: number}>(e, 'SELECT result,COUNT(*) n FROM deletion_items WHERE batch_id=? GROUP BY result', batchId);
   const count = (result: string) => counts.find(r => r.result === result)?.n ?? 0;
   await notify(e, `clear:${batchId}:summary`, u.thread_id, `清空已处理：确认删除 ${count('deleted')}；明确失败 ${count('failed')}；不可删除/未发送 ${count('unavailable')}；结果未知 ${count('unknown')}。确认后新消息不在本次范围内。旧系统未记录历史无法追溯，数量未知。管理员历史和话题保留。`);

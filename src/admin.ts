@@ -53,7 +53,7 @@ async function createAction(e: Env, kind: string, u: UserRow | null, actor: stri
  await run(e,'INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) VALUES(?,?,?,?,?,?,?,?)',token,kind,u?.tgid ?? '',actor,thread,u?.binding_version ?? 0,JSON.stringify({...payload,instance:e.INSTANCE_ID,...(context ? {context} : {})}),expires);
  return token;
 }
-async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: Action, stamp?: number) {
+async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: Action, stamp?: number,waitUntil?:(promise:Promise<unknown>)=>void) {
  const logThread = Number(await setting(e,'log_thread_id','0'));
  if (thread <= 1 || thread === logThread) return false;
  const queries: D1PreparedStatement[] = [];
@@ -64,7 +64,7 @@ async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: 
  await e.DB.batch(queries);
  const current = await user(e,u.tgid);
  const success = current?.thread_id === thread && current.binding_version === u.binding_version+1;
- if (success) await audit(e,'binding_changed',{user:u.tgid,from:u.thread_id,to:thread,version:current.binding_version,actor});
+ if (success) await audit(e,'binding_changed',{user:u.tgid,from:u.thread_id,to:thread,version:current.binding_version,actor},waitUntil);
  return success;
 }
 async function retryKnownCreationFailures(e: Env, job: Job, u: UserRow) {
@@ -82,7 +82,7 @@ async function retryKnownCreationFailures(e: Env, job: Job, u: UserRow) {
  }
 }
 
-export async function ensureThread(e: Env, job: Job, userId: string, prepareCard = true): Promise<UserRow> {
+export async function ensureThread(e: Env, job: Job, userId: string, prepareCard = true,waitUntil?:(promise:Promise<unknown>)=>void): Promise<UserRow> {
  let u = await ensureUser(e,userId,undefined,job.created_at);
  if (u.thread_id) return u;
  const profile = await call<TGUser>(e,`job:${job.id}:profile:${userId}`,'getChat',{chat_id:userId});
@@ -92,14 +92,14 @@ export async function ensureThread(e: Env, job: Job, userId: string, prepareCard
  const creationKey = await setting(e,`thread_create_key:${userId}`,`thread:create:${userId}`);
  const result = await call<{message_thread_id:number}>(e,creationKey,'createForumTopic',{chat_id:e.ADMIN_CHAT_ID,name:displayName(u).slice(0,110)});
  if (result.status !== 'success' || !Number.isSafeInteger(result.result.message_thread_id) || result.result.message_thread_id <= 1) {
-  await audit(e,'thread_create_unavailable',{user:userId,status:result.status});
+  await audit(e,'thread_create_unavailable',{user:userId,status:result.status},waitUntil);
   return u;
  }
- if (!await bind(e,u,result.result.message_thread_id,'system')) {
-  await audit(e,'thread_create_binding_conflict',{user:userId,thread:result.result.message_thread_id});
+ if (!await bind(e,u,result.result.message_thread_id,'system',undefined,undefined,waitUntil)) {
+  await audit(e,'thread_create_binding_conflict',{user:userId,thread:result.result.message_thread_id},waitUntil);
   return (await user(e,userId))!;
  }
- if(prepareCard)await refreshCard(e,job,userId);
+ if(prepareCard)await refreshCard(e,job,userId,false,waitUntil);
  return (await user(e,userId))!;
 }
 
@@ -330,7 +330,7 @@ async function adminSettingApplied(e:Env,job:Job,key:string) {
 }
 /** The mutation, its audit and the original job's completion marker commit
  * together. A deferred confirmation can never reapply an old setting. */
-async function applyAdminSetting(e:Env,job:Job,key:string,value:string,event:string,detail:Params,thread?:number) {
+async function applyAdminSetting(e:Env,job:Job,key:string,value:string,event:string,detail:Params,thread?:number,waitUntil?:(promise:Promise<unknown>)=>void) {
  const epochGate=logEpochStatements(e);
  const pending="EXISTS(SELECT 1 FROM jobs WHERE id=? AND epoch=? AND json_extract(payload,'$.adminSettingApplied') IS NULL)";
  const available=thread===undefined?'':" AND NOT EXISTS(SELECT 1 FROM users WHERE thread_id=?) AND NOT EXISTS(SELECT 1 FROM thread_history WHERE thread_id=?)";
@@ -342,7 +342,10 @@ async function applyAdminSetting(e:Env,job:Job,key:string,value:string,event:str
   stmt(e,`UPDATE jobs SET payload=json_set(payload,'$.adminSettingApplied',?) WHERE id=? AND epoch=? AND json_extract(payload,'$.adminSettingApplied') IS NULL${available} AND EXISTS(SELECT 1 FROM settings WHERE key=? AND value=?)`,key,...args,key,value),
   ...logOutboxStatements(e)
  ]);
- if(results.slice(epochGate.length+3).some(result=>result.meta.changes>0))await wakeLogs(e);
+ if(results.slice(epochGate.length+3).some(result=>result.meta.changes>0)) {
+  const wake=wakeLogs(e);
+  if(waitUntil)waitUntil(wake);else await wake;
+ }
  return adminSettingApplied(e,job,key);
 }
 async function unknownOperations(e: Env, job: Job) {
@@ -422,7 +425,10 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
     stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked),
     ...logOutboxStatements(e)
    ]);
-   if(mutations.slice(epochGate.length+3).some(result=>result.meta.changes>0))await wakeLogs(e);
+   if(mutations.slice(epochGate.length+3).some(result=>result.meta.changes>0)) {
+    const wake=wakeLogs(e);
+    if(waitUntil)waitUntil(wake);else await wake;
+   }
    const applied = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',a.token);
    if (applied?.used!==stamp) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
   } else if (u.blocked!==blocked) {
@@ -436,7 +442,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  } else if (a.kind==='bind_confirm') {
   const to = Number(payload.to);
   if (a.used!==stamp || u.binding_version===a.version) {
-   if (!await bind(e,u,to,String(cb.from.id),a,stamp)) {await answer(e,job,cb.id,'绑定状态已变化或目标话题已被占用，请重新 /tj。');return;}
+   if (!await bind(e,u,to,String(cb.from.id),a,stamp,waitUntil)) {await answer(e,job,cb.id,'绑定状态已变化或目标话题已被占用，请重新 /tj。');return;}
   }
   await refreshCard(e,job,u.tgid,false,waitUntil);
   await answer(e,job,cb.id,'已切换；原话题与消息映射已保留。');
@@ -452,7 +458,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  } else await answer(e,job,cb.id,'按钮已失效。');
 }
 
-async function register(e: Env, job: Job, m: TGMessage, id: string) {
+async function register(e: Env, job: Job, m: TGMessage, id: string,waitUntil?:(promise:Promise<unknown>)=>void) {
  const thread = threadOf(m);
  const reply = (text: string, extra: Params = {}) => notify(e,`job:${job.id}:register:reply`,thread,text,extra);
  if (!validUserId(id)) {await reply('用法：/tj TGID（正整数用户 ID）。');return;}
@@ -462,9 +468,9 @@ async function register(e: Env, job: Job, m: TGMessage, id: string) {
  if (profile.status==='success') u = await ensureUser(e,id,profile.result,job.created_at);
  await retryKnownCreationFailures(e,job,u);
  if (!thread) {
-  u = await ensureThread(e,job,id);
+  u = await ensureThread(e,job,id,true,waitUntil);
   if (u.thread_id) {
-   await refreshCard(e,job,id,true);
+   await refreshCard(e,job,id,true,waitUntil);
    await reply('已登记。首次联系与当前绑定已保留。注册不保证能够主动私信从未联系机器人的用户。',{reply_markup:{inline_keyboard:[[{text:'打开当前话题',url:topicLink(e,u.thread_id,u.card_id ?? u.thread_id)}]]}});
   } else await reply('话题未就绪。创建失败或结果未知已记账；不会盲目重复创建，请检查系统日志。');
   return;
@@ -472,13 +478,13 @@ async function register(e: Env, job: Job, m: TGMessage, id: string) {
  const occupant = await one<{tgid:string}>(e,'SELECT tgid FROM users WHERE thread_id=?',thread);
  if (occupant && occupant.tgid!==id) {await reply('当前话题已属于另一用户，拒绝绑定。');return;}
  if (u.thread_id===thread) {
-  await refreshCard(e,job,id,true);await reply('已绑定当前话题；无需重复登记。');return;
+  await refreshCard(e,job,id,true,waitUntil);await reply('已绑定当前话题；无需重复登记。');return;
  }
  if (u.thread_id) {
   await confirmation(e,job,u,String(m.from!.id),thread,'bind_confirm',`TGID ${id} 当前绑定话题 ${u.thread_id}。确认切换到本话题？原话题与历史保留，切换后原话题停止普通转发。`,{to:thread,from:u.thread_id});return;
  }
- if (!await bind(e,u,thread,String(m.from!.id))) {await reply('绑定状态已变化或话题被占用，请重新 /tj。');return;}
- await refreshCard(e,job,id);await reply('已绑定当前话题，管理员历史已保留。');
+ if (!await bind(e,u,thread,String(m.from!.id),undefined,undefined,waitUntil)) {await reply('绑定状态已变化或话题被占用，请重新 /tj。');return;}
+ await refreshCard(e,job,id,false,waitUntil);await reply('已绑定当前话题，管理员历史已保留。');
 }
 
 /** All callback traffic and slash commands are management, never chat payload. */
@@ -510,12 +516,12 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
  const name = command[1].toLowerCase();
  const args = (command[3] ?? '').trim();
  const thread = threadOf(m);
- if (name==='tj') {await register(e,job,m,args);return true;}
+ if (name==='tj') {await register(e,job,m,args,waitUntil);return true;}
  if (name==='sc') {
   const u = thread ? await one<UserRow>(e,'SELECT * FROM users WHERE thread_id=?',thread) : null;
   if (!u) {await notify(e,`job:${job.id}:sc:invalid`,thread,'请在当前有效用户话题中回复一条已知消息执行 /sc。');return true;}
   if (!await admittedBindingMatches(e,job,m,u)) {await notify(e,`job:${job.id}:sc:stale`,thread,'绑定已变化，旧删除命令未执行。请在当前话题重新确认目标。');return true;}
-  await deleteSingle(e,job,m,u);
+  await deleteSingle(e,job,m,u,waitUntil);
   return true;
  }
  if (name!=='mb') return true;
@@ -536,14 +542,14 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
   }
   const test = await notify(e,`job:${job.id}:logtopic:test`,destination,'管理员指定此话题作为系统日志话题。历史待报事件将继续补报。');
   if (test.status!=='success') {await notify(e,`job:${job.id}:logtopic:failed`,null,'日志话题验证未成功，配置保持原值。请检查话题与机器人权限。');return true;}
-  if(!await applyAdminSetting(e,job,'log_thread_id',String(destination),'log_topic_changed',{thread:destination,actor:String(m.from!.id)},destination)) {await notify(e,`job:${job.id}:logtopic:conflict`,null,'该话题刚被用户绑定，日志配置保持原值。');return true;}
+  if(!await applyAdminSetting(e,job,'log_thread_id',String(destination),'log_topic_changed',{thread:destination,actor:String(m.from!.id)},destination,waitUntil)) {await notify(e,`job:${job.id}:logtopic:conflict`,null,'该话题刚被用户绑定，日志配置保持原值。');return true;}
   await confirm();
  }
  else if (view==='timezone') {
   const confirm=()=>notify(e,`job:${job.id}:timezone:ok`,null,`时区已设为 ${value}。底层时间继续保存 UTC。`);
   if(await adminSettingApplied(e,job,'timezone')) {await confirm();return true;}
   try {new Intl.DateTimeFormat('en',{timeZone:value}).format();} catch {await notify(e,`job:${job.id}:timezone:invalid`,null,'时区无效，请使用 IANA 时区，例如 Asia/Singapore。');return true;}
-  await applyAdminSetting(e,job,'timezone',value,'setting_changed',{key:'timezone',actor:String(m.from!.id)});
+  await applyAdminSetting(e,job,'timezone',value,'setting_changed',{key:'timezone',actor:String(m.from!.id)},undefined,waitUntil);
   await confirm();
  } else if (view==='start' || view==='help') {
   const confirm=()=>notify(e,`job:${job.id}:template:ok`,null,`${view==='start'?'欢迎':'帮助'}文案已更新。`);
@@ -558,7 +564,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
   if (expandedLength>4096) {
    await notify(e,`job:${job.id}:template:too-long`,null,'文案变量替换后可能超过 Telegram 4096 字符限制，请减少文案长度或变量重复次数。');return true;
   }
-  await applyAdminSetting(e,job,view+'_text',template,'setting_changed',{key:view+'_text',actor:String(m.from!.id)});
+  await applyAdminSetting(e,job,view+'_text',template,'setting_changed',{key:view+'_text',actor:String(m.from!.id)},undefined,waitUntil);
   await confirm();
  } else await notify(e,`job:${job.id}:mb:help`,null,'用法：/mb [today|7|30|all]、/mb users [页码]、/mb search TGID、/mb settings、/mb timezone 时区、/mb start 文案、/mb help 文案、/mb logtopic 话题ID、/mb unknown。');
  return true;

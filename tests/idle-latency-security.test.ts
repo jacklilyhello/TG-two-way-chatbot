@@ -114,7 +114,10 @@ describe('batched idle path preserves live security checks',()=>{
   const processing=execute(e,job,promise=>{scheduled.push(promise);}).then(()=>{complete=true;});
   try {
    await vi.waitFor(()=>expect(complete).toBe(true));
-   expect(answerChecked).toBe(true);expect(scheduled).toHaveLength(1);
+   // The committed binding audit and committed card each have one independent
+   // wake promise; neither is allowed to delay the callback answer.
+   expect(answerChecked).toBe(true);expect(scheduled).toHaveLength(2);
+   expect(await one(e,"SELECT event FROM audit_logs WHERE event='binding_changed'")).toEqual({event:'binding_changed'});
   } finally {finish();await processing;await Promise.all(scheduled);}
  });
  it('does not claim binding completion before card persistence, then safely resumes the same confirmation',async()=>{
@@ -132,9 +135,17 @@ describe('batched idle path preserves live security checks',()=>{
    const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
   }});
   beforeBotIssue(async()=>{});
+  const wakeKeys:string[]=[];
+  e.JOBS={send:async(body:{key:string})=>{wakeKeys.push(body.key);}} as unknown as Queue;
+  e.CONVERSATIONS={idFromName:(name:string)=>name,get:(key:string)=>({fetch:async()=>{wakeKeys.push(key);return new Response('ok');}})} as unknown as DurableObjectNamespace;
   const scheduled:Promise<unknown>[]=[];
   await expect(execute(e,job,promise=>{scheduled.push(promise);})).rejects.toThrow('card commit failed');
-  expect(vi.mocked(fetch)).not.toHaveBeenCalled();expect(scheduled).toEqual([]);
+  expect(vi.mocked(fetch)).not.toHaveBeenCalled();expect(scheduled).toHaveLength(1);
+  await Promise.all(scheduled);
+  // Binding/audit persistence already succeeded; only its system hints may
+  // run. The rejected card transaction must never emit its own wake hints.
+  expect(wakeKeys).toEqual(['system','system']);
+  expect(await one(e,"SELECT id FROM jobs WHERE kind='card'")).toBeNull();
   expect(await one(e,"SELECT thread_id,binding_version FROM users WHERE tgid='20001'")).toEqual({thread_id:41,binding_version:2});
   e.DB=database;
   vi.mocked(fetch).mockResolvedValue(Response.json({ok:true,result:true}));
@@ -142,5 +153,6 @@ describe('batched idle path preserves live security checks',()=>{
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   expect(await one(e,"SELECT thread_id,binding_version FROM users WHERE tgid='20001'")).toEqual({thread_id:41,binding_version:2});
   expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE kind='card'")).toEqual({n:1});
+  expect(wakeKeys.filter(key=>key==='card:20001')).toHaveLength(2);
  });
 });

@@ -1,6 +1,6 @@
 import type {Env,TGUpdate,TGMessage,UserRow} from './types';
 import {one,stmt,now} from './db';
-import {adminBinding,internalForward} from './security';
+import {adminBinding,internalForward,type PrivateAdmission} from './security';
 interface Action {token:string;kind:string;user_id:string;actor_id:string;thread_id:number;version:number;payload:string;expires_at:number;used:number}
 export function authorized(e:Env,id?:number) {return !!id&&e.ADMIN_IDS.split(',').map(s=>s.trim()).includes(String(id));}
 export function command(m:TGMessage) {return (m.text??'').startsWith('/');}
@@ -19,7 +19,7 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
  let key='system',uid:string|undefined,dir='in';
  let action:Action|null=null;
  let current:UserRow|null=null;
- if(m?.chat.type==='private'&&m.from&&m.chat.id===m.from.id&&!m.from.is_bot) {uid=String(m.from.id);key=uid;}
+ if(m?.chat.type==='private'&&m.from&&m.chat.id===m.from.id&&!m.from.is_bot) {uid=String(m.from.id);key=uid;current=await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid);}
  else if(m&&String(m.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,m.from?.id)&&!m.sender_chat) {
   const target=m.text?.match(/^\/tj(?:@[\w]+)?\s+(\d{1,16})(?:\s|$)/i);
   current=await one<UserRow>(e,'SELECT * FROM users WHERE thread_id=?',m.message_thread_id??0);
@@ -30,7 +30,8 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
   if(action) {uid=action.user_id;key=uid;current=await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid);}
   else key='admin';
  }
- const p={update:u,...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
+ const privateAdmission:PrivateAdmission|undefined=m&&uid&&dir==='in'?{instance:e.INSTANCE_ID,userId:uid,thread:current?.thread_id??null,version:current?.binding_version??0,blocked:current?.blocked===1}:undefined;
+ const p={update:u,...(privateAdmission?{privateAdmission}:{}),...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
  const sql:D1PreparedStatement[]=[
   stmt(e,'INSERT OR IGNORE INTO inbox_updates(update_id,payload,received_at) VALUES(?,?,?)',u.update_id,JSON.stringify(u),time),
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES(?,?,?,?,'pending',?,?,?)",`u:${u.update_id}`,key,'update',JSON.stringify(p),time,e.RECOVERY_EPOCH,time)

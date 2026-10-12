@@ -77,7 +77,8 @@ export class BotCoordinator {
   if(rateCheckedAt<due) return Response.json({due},{status:429,headers:!exempt&&backoffAt<=rateCheckedAt&&due-rateCheckedAt<=maxLocalWaitMs?{[localRateDueHeader]:String(due)}:{}});
   const checks:D1PreparedStatement[]=[];
   const hiddenIndex=guard?.messageIds?.length?checks.push(this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds))-1:-1;
-  const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
+  const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id,blocked FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
+  const policyIndex=guard?.unblockedUser?(guard.unblockedUser===guard.threadVersion?.userId?bindingIndex:checks.push(this.env.DB.prepare('SELECT blocked FROM users WHERE tgid=?').bind(guard.unblockedUser))-1):-1;
   // Complex guards perform additional reads. Keep pause after those reads so
   // it remains the final safety check, while ordinary sends use one D1 batch.
   const deferPause=!!(guard?.receipt||guard?.deliveryRetry);
@@ -85,8 +86,9 @@ export class BotCoordinator {
   const checked=checks.length?await this.env.DB.batch(checks):[];
   if(guard) {
    const hidden=hiddenIndex>=0&&checked[hiddenIndex].results.length>0;
-   const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number}|undefined:undefined;
-   if(hidden||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
+   const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number;blocked:number}|undefined:undefined;
+   const policy=policyIndex>=0?checked[policyIndex].results[0] as {blocked:number}|undefined:undefined;
+   if(hidden||(guard.unblockedUser&&policy?.blocked!==0)||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
     const outcome:Outcome={status:'failed',reason:'cancelled_by_state',code:409};
     await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
    }
