@@ -113,8 +113,8 @@ describe('durable event-driven log outbox',()=>{
    instance.armLogs=async(request:Request)=>{
     await state.storage.put('self-arm-seen',true);
     const response=await arm(request);
-    // Read native persisted state before bootstrap resumes: its limiter retry
-    // can advance this short Alarm, which may fire before the final assertions.
+    // Read native persisted state before bootstrap resumes: its next menu
+    // operation can advance this short Alarm before the final assertions.
     await state.storage.put('self-arm-persisted-alarm',await state.storage.getAlarm());
     return response;
    };
@@ -124,8 +124,12 @@ describe('durable event-driven log outbox',()=>{
    :Response.json({ok:false,error_code:400,description:'synthetic menu refusal'}));
   await wake(); // A menu failure creates the first audit/outbox inside the DO.
   expect(await runInDurableObject(system(),(_instance,state)=>state.storage.get('self-arm-seen'))).toBe(true);
-  expect(await one(base,"SELECT COUNT(*) n FROM audit_logs WHERE event='命令菜单设置异常'")).toEqual({n:1});
-  expect(await logJobs()).toHaveLength(1);
+  // Both distinct menu scopes now finish in one wake across the short global
+  // pacing deadline. The first log-topic refusal also finishes this wake,
+  // leaving exactly one pending continuation for the retained audit batch.
+  expect(await one(base,"SELECT COUNT(*) n FROM audit_logs WHERE event='命令菜单设置异常'")).toEqual({n:2});
+  expect((await logJobs()).map(job=>job.state)).toEqual(['done','pending']);
+  expect(vi.mocked(fetch).mock.calls.filter(([request])=>String(request).endsWith('/setMyCommands'))).toHaveLength(2);
   const armedAt=await runInDurableObject(system(),(_instance,state)=>state.storage.get<number>('self-arm-persisted-alarm'));
   expect(armedAt).toBeGreaterThan(0);
  },5000);

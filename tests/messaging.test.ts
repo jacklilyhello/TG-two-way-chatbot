@@ -310,6 +310,38 @@ describe('persistent messaging and deletion invariants', () => {
     expect(await one(e, "SELECT state FROM deletion_batches WHERE id='bounded'")).toEqual({state: 'done'});
   });
 
+  it.each([
+    {label:'topic-created root',replyId:77,service:true,expectedAudits:0},
+    {label:'unmapped ordinary root message',replyId:77,service:false,expectedAudits:1},
+    {label:'another topic-created service message',replyId:78,service:true,expectedAudits:1},
+  ])('omits $label from the private copy with the appropriate fallback audit', async sample => {
+    const root=adminMessage(sample.replyId,{text:undefined,...(sample.service?{forum_topic_created:{name:'Synthetic topic',icon_color:0}}:{})});
+    const outbound=adminMessage(155,{reply_to_message:root});
+    await record(outbound);
+    await handleMessage(e,job(46,outbound),outbound,false);
+    expect(requests.filter(r=>r.method==='copyMessage')).toHaveLength(1);
+    expect(requests.find(r=>r.method==='copyMessage')?.params.reply_parameters).toBeUndefined();
+    expect(await all(e,"SELECT id FROM audit_logs WHERE event='reply_fallback'")).toHaveLength(sample.expectedAudits);
+  });
+
+  it('retains fallback accounting for a private message with a forged forum-root shape', async () => {
+    const incoming=privateMessage(156,{message_thread_id:77,is_topic_message:true,reply_to_message:privateMessage(77,{text:undefined,forum_topic_created:{name:'Synthetic topic',icon_color:0}})});
+    await record(incoming);
+    await handleMessage(e,job(47,incoming),incoming,false);
+    expect(requests.find(r=>r.method==='copyMessage')?.params.reply_parameters).toBeUndefined();
+    expect(await all(e,"SELECT id FROM audit_logs WHERE event='reply_fallback'")).toHaveLength(1);
+  });
+
+  it.each(['quote','external_reply'])('retains fallback accounting when a service-root message includes explicit %s metadata', async field => {
+    const root=adminMessage(77,{text:undefined,forum_topic_created:{name:'Synthetic topic',icon_color:0}});
+    const outbound=adminMessage(157,{reply_to_message:root});
+    Object.assign(outbound,{[field]:{text:'Synthetic explicit quote',position:0}});
+    await record(outbound);
+    await handleMessage(e,job(48,outbound),outbound,false);
+    expect(requests.find(r=>r.method==='copyMessage')?.params.reply_parameters).toBeUndefined();
+    expect(await all(e,"SELECT id FROM audit_logs WHERE event='reply_fallback'")).toHaveLength(1);
+  });
+
   it('maps reply references across both directions without quoting another user', async () => {
     const incoming = await record(privateMessage(146));
     await run(e, "UPDATE messages SET admin_id=946,thread_id=77,delivery='success' WHERE id=?", incoming.id);

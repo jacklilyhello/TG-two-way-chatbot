@@ -11,6 +11,7 @@ export interface TGMessage {
   photo?: {file_id: string}[]; video?: {file_id: string}; audio?: {file_id: string}; voice?: {file_id: string};
   document?: {file_id: string}; sticker?: {file_id: string}; animation?: {file_id: string};
   media_group_id?: string; reply_to_message?: TGMessage;
+  forum_topic_created?: {name:string;icon_color:number;icon_custom_emoji_id?:string};
   forward_origin?: TGMessageOrigin;
 }
 export interface TGUpdate {update_id: number; message?: TGMessage; edited_message?: TGMessage; callback_query?: {id: string; from: TGUser; data?: string; message?: TGMessage}}

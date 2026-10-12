@@ -28,6 +28,8 @@ function directBot(options:{afterChecks?:()=>void;beforePut?:(entries:Record<str
 }
 beforeEach(()=>{
  clock=100000;apiStarts=[];vi.spyOn(Date,'now').mockImplementation(()=>clock);
+ const schedule=setTimeout;
+ vi.spyOn(globalThis,'setTimeout').mockImplementation(((handler:()=>void,delay=0)=>{clock+=delay;return schedule(handler,0);}) as typeof setTimeout);
  vi.mocked(fetch).mockImplementation(async()=>{apiStarts.push(clock);return Response.json({ok:true,result:true});});
 });
 
@@ -38,10 +40,11 @@ describe('non-sending Telegram mutation pacing',()=>{
   expect(values.get(`rate:mutation:${base.ADMIN_CHAT_ID}`)).toBe(103100);
   expect(values.has(`rate:${base.ADMIN_CHAT_ID}`)).toBe(false);
   clock=100039;
-  expect((await invoke('global-blocked','sendMessage',{chat_id:20001,text:'Synthetic reply'})).status).toBe(429);
+  expect((await invoke('global-blocked','sendMessage',{chat_id:20001,text:'Synthetic reply'})).status).toBe(200);
+  expect(apiStarts[1]).toBe(100040);
   clock=100050;
   expect((await invoke('send-after-mutation','sendMessage')).status).toBe(200);
-  expect(apiStarts).toEqual([100000,100050]);
+  expect(apiStarts).toEqual([100000,100040,100080]);
  });
  it('shares one conservative mutation lane across edits, deletion and unpinning',async()=>{
   const {invoke}=directBot();
@@ -66,7 +69,8 @@ describe('non-sending Telegram mutation pacing',()=>{
   expect((await invoke('private-edit','editMessageText',{chat_id:20001,message_id:2})).status).toBe(200);
   expect(values.get('rate:mutation:20001')).toBe(101150);
   clock+=50;
-  expect((await invoke('private-delete','deleteMessage',{chat_id:20001,message_id:2})).status).toBe(429);
+  expect((await invoke('private-delete','deleteMessage',{chat_id:20001,message_id:2})).status).toBe(200);
+  expect(apiStarts.at(-1)).toBe(101150);
  });
  it.each(['pinChatMessage','createForumTopic'])('retains %s in the group send lane',async method=>{
   const {values,invoke}=directBot();await invoke('service',method);clock+=50;
@@ -110,7 +114,7 @@ describe('rate deadlines use the real API start after slow guards and storage',(
   await invoke('first',method);
   expect(apiStarts).toEqual([105000]);expect(values.get(lane)).toBe(105000+gap);
   clock+=50;
-  expect((await invoke('next',method)).status).toBe(429);
+  expect((await invoke('next',method)).status).toBe(gap-50<=1000?200:429);
   clock=105000+gap;expect((await invoke('next',method)).status).toBe(200);
   expect(apiStarts[1]-apiStarts[0]).toBe(gap);
  });

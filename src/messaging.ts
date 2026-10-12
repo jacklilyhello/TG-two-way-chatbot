@@ -79,6 +79,9 @@ async function restoreDeliveryNotice(e: Env, row: MessageRow, waitUntil?: WaitUn
 async function replyParameters(e: Env, row: MessageRow, m: TGMessage): Promise<Params> {
   if (!m.reply_to_message) return {};
   if (String(m.reply_to_message.chat.id) !== row.source_chat) return {};
+  // Telegram attaches the topic-created service root to ordinary forum
+  // messages. It has no business quote to map or missing-quote audit to wake.
+  if (row.direction === 'out' && m.is_topic_message && m.message_thread_id === row.thread_id && m.reply_to_message.message_id === m.message_thread_id && m.reply_to_message.forum_topic_created && !('quote' in m) && !('external_reply' in m)) return {};
   const column = row.direction === 'in' ? 'private_id' : 'admin_id';
   const target = await one<MessageRow>(e, `SELECT * FROM messages WHERE user_id=? AND ${column}=? ORDER BY id DESC LIMIT 1`, row.user_id, m.reply_to_message.message_id);
   const targetId = row.direction === 'in' ? target?.admin_id : target?.private_id;
