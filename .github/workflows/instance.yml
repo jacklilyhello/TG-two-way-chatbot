@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       instance:
-        description: Private environment instance alias (for example test-a)
+        description: Exactly one independent instance and its matching GitHub Environment
         required: true
-        type: string
+        type: choice
+        options: [test-a, test-b, prod-support, prod-ad]
       release_sha:
         description: Exact 40-character commit SHA already merged into main
         required: true
@@ -18,7 +19,7 @@ on:
         type: choice
         options: [status, deploy, pause, resume, recover, export]
       provision:
-        description: Create missing resources for a new instance only
+        description: Deploy only; serialize first or partial initialization in the shared account
         default: false
         type: boolean
       configure_webhook:
@@ -35,6 +36,7 @@ permissions:
 concurrency:
   group: instance-${{ inputs.instance }}
   cancel-in-progress: false
+  queue: max
 jobs:
   guard:
     if: github.ref == 'refs/heads/main'
@@ -49,9 +51,11 @@ jobs:
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
           INSTANCE_ID: ${{ inputs.instance }}
+          OPERATION: ${{ inputs.operation }}
+          PROVISION: ${{ inputs.provision }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          node --input-type=module -e 'if (!/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA) || !/^[a-z][a-z0-9-]{0,30}$/.test(process.env.INSTANCE_ID)) process.exit(1)'
+          node --input-type=module -e 'if (!/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA) || !["test-a","test-b","prod-support","prod-ad"].includes(process.env.INSTANCE_ID) || !["status","deploy","pause","resume","recover","export"].includes(process.env.OPERATION) || (process.env.PROVISION === "true" && process.env.OPERATION !== "deploy")) process.exit(1)'
           git cat-file -e "$RELEASE_SHA^{commit}"
           git merge-base --is-ancestor "$RELEASE_SHA" origin/main
           gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$RELEASE_SHA&status=success&per_page=100" --jq '.workflow_runs | any(.head_sha == env.RELEASE_SHA and .event == "push" and .head_branch == "main")' | grep -qx true
@@ -59,18 +63,33 @@ jobs:
     needs: guard
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # The workflow holds the instance lock while this distinct job lock serializes
+    # initialization in the only Cloudflare account. All inventory reads and
+    # resource creation happen after acquiring it; normal upgrades remain scoped.
+    concurrency:
+      group: ${{ inputs.operation == 'deploy' && inputs.provision && 'tg-two-way-account-initialize' || format('tg-two-way-operation-{0}', inputs.instance) }}
+      cancel-in-progress: false
+      queue: max
     environment: tg-two-way-${{ inputs.instance }}
     env:
       INSTANCE_ID: ${{ inputs.instance }}
       RELEASE_SHA: ${{ inputs.release_sha }}
       OPERATION: ${{ inputs.operation }}
       PROVISION: ${{ inputs.provision }}
+      INITIALIZATION_LOCK_HELD: ${{ inputs.operation == 'deploy' && inputs.provision && 'true' || 'false' }}
       CONFIGURE_WEBHOOK: ${{ inputs.configure_webhook }}
       OLD_CONSUMER_STOPPED: ${{ inputs.old_consumer_stopped }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.release_sha }}
+          persist-credentials: false
+      # Always use the safety controls from the main commit that dispatched this
+      # run, even when the selected application release is an older main SHA.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .deployment-control
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -80,7 +99,7 @@ jobs:
       - name: Check instance boundaries
         env:
           INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
-        run: node scripts/check-instances.mjs
+        run: node .deployment-control/scripts/check-instances.mjs
       - name: Execute scoped operation
         env:
           INSTANCE_CONFIG_JSON: ${{ secrets.INSTANCE_CONFIG_JSON }}
@@ -89,7 +108,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
           BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
-        run: node scripts/deploy-instance.mjs
+        run: node .deployment-control/scripts/deploy-instance.mjs
       - name: Encrypt private export
         if: inputs.operation == 'export'
         env:
@@ -110,4 +129,4 @@ jobs:
           retention-days: 7
       - name: Remove private temporary files
         if: always()
-        run: rm -rf .local
+        run: rm -rf .local .deployment-control

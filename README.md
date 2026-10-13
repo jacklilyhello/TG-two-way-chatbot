@@ -1,6 +1,6 @@
 # TG-two-way-chatbot
 
-原生 Cloudflare 的 Telegram 纯人工双向聊天机器人。每个 Bot 使用独立 Worker、D1、任务队列、失败队列、Durable Objects、Secrets 和发布版本；共享的只有源码。
+原生 Cloudflare 的 Telegram 纯人工双向聊天机器人。使用一个 GitHub 仓库、一个 Cloudflare 账户和共用 Actions 部署凭据；每个 Bot 使用独立 Worker、D1、任务队列、失败队列、Durable Objects、Telegram Secrets、业务设置和发布版本。
 
 普通用户发送消息后，由管理员在 Forum 用户话题中人工回复。用户端仅在主动发送 `/start`、`/help` 时收到固定文案；投递状态、封禁状态和内部错误均留在管理员侧。
 
@@ -23,7 +23,7 @@ Telegram 的删除时限、用户隐私、媒体能力、群组权限和接口�
 ```sh
 npm ci
 npm run check
-node --test scripts/deployment.node-test.mjs
+node --test scripts/*.node-test.mjs
 node scripts/check-instances.mjs
 npm run build
 ```
@@ -41,7 +41,11 @@ npm run dev
 
 Cloudflare 写入仅通过本仓库 GitHub Actions 执行。`CI` 只检查代码；合并不会自动发布全部实例。`Instance operations` 每次明确选择一个实例及已通过 main CI 的完整提交 SHA。
 
-实例模板中的所有身份均为假值。首次使用需在私有 GitHub Environment 中配置测试 Bot、Forum 群组、授权管理员与 Secrets；未配置时发布会拒绝执行。仓库不提供默认可接管的真实 Bot。
+正式实例固定为 `prod-support` / `tg-two-way-prod-support` 与 `prod-ad` / `tg-two-way-prod-ad`。保留现有 `test-a`、`test-b` 的 Environment、资源、数据与历史；正式 Environment 另建并限制来源为 main。管理员账号可以相同，管理员 Forum 群组必须独立。
+
+四份 `instances/*.example.json` 中的身份均为占位假值，示例域名也未经可用性确认。每个 Environment 分别填写同名的 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_WEBHOOK_SECRET`、`INSTANCE_CONFIG_JSON`，不回退到另一个实例的配置。仓库级 `CLOUDFLARE_API_TOKEN` Secret 与 `CLOUDFLARE_ACCOUNT_ID` Variable 共用，Cloudflare Token 只供 Actions 使用，不安装到聊天 Worker。缺少正式配置时可先建立空 Environment，发布会拒绝执行。
+
+首次初始化显式启用 `provision`，在账户初始化锁内重新读取实际资源和管理员群组归属后创建；创建后把精确 `d1_id`、`queue_id`、`dlq_id` 安全回填到对应 Environment 的 `INSTANCE_CONFIG_JSON`。Worker 尚未安装时，即使资源已全部创建并回填，也须启用 `provision` 继续初始化。已有实例按实例互斥独立升级，允许两个实例运行不同版本；部署完成仍暂停，核对 `status` 和 Webhook 后显式 `resume`。完整步骤见部署文档。
 
 - [部署与实例配置](docs/deployment.md)
 - [管理员使用](docs/administration.md)
