@@ -1,0 +1,12 @@
+{
+  "instance_id": "prod-ad",
+  "expected_bot_id": "555666777",
+  "admin_chat_id": "-1005556667770",
+  "admin_ids": ["112233445"],
+  "hostname": "two-way-prod-ad.lilyya.top",
+  "worker_name": "tg-two-way-prod-ad",
+  "d1_name": "tg-two-way-prod-ad-db",
+  "queue_name": "tg-two-way-prod-ad-jobs",
+  "dlq_name": "tg-two-way-prod-ad-dlq",
+  "recovery_epoch": "initial"
+}

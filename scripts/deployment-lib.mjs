@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { assertDrillBindings } from './reliability-drill-lib.mjs';
 
 export async function awaitReleaseHealth(url, version, { fetcher = fetch, wait = delay, attempts = 6 } = {}) {
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -55,6 +56,98 @@ export function assertRemoteIdentity(config, settings) {
   }
 }
 
+/** Read actual Worker settings, rather than trusting committed example manifests. */
+export function assertProjectWorkerIsolation(config, workers) {
+  for (const { name, settings } of workers) {
+    const bindings = settings?.bindings;
+    if (!Array.isArray(bindings)) throw new Error('Worker binding inventory is incomplete; inspect account Worker settings before retrying');
+    const markers = ['INSTANCE_ID', 'EXPECTED_BOT_ID', 'ADMIN_CHAT_ID'];
+    const isProject = name.startsWith('tg-two-way-') || bindings.some(binding => markers.includes(binding.name));
+    if (!isProject) continue;
+    const text = key => {
+      const matches = bindings.filter(binding => binding.name === key);
+      return matches.length === 1 ? matches[0].text : undefined;
+    };
+    const instance = text('INSTANCE_ID');
+    const bot = text('EXPECTED_BOT_ID');
+    const chat = text('ADMIN_CHAT_ID');
+    const ownershipError = () => new Error('Project Worker ownership cannot be confirmed; inspect INSTANCE_ID, EXPECTED_BOT_ID and ADMIN_CHAT_ID bindings and any retained reliability drill before retrying');
+    if (!/^[a-z][a-z0-9-]{0,30}$/.test(instance ?? '') || !/^[1-9]\d{0,15}$/.test(bot ?? '') || !Number.isSafeInteger(Number(bot)) || !/^-100\d{5,15}$/.test(chat ?? '') || !Number.isSafeInteger(Number(chat))) throw ownershipError();
+    const drillRun = text('DRILL_RUN_ID');
+    const isDrill = ['test-a', 'test-b'].includes(instance) && /^\d{1,20}-\d{1,3}$/.test(drillRun ?? '') && name === `tg-two-way-${instance}-reliability-${drillRun}`;
+    if (name !== `tg-two-way-${instance}`) {
+      if (!isDrill || bot !== '42424240' || chat !== '-1004242424242') throw ownershipError();
+      try {
+        const db = bindings.find(binding => binding.name === 'DB');
+        assertDrillBindings({ config: { instance_id: instance }, run: drillRun, name, queue: `${name}-jobs` }, settings, db?.database_id ?? db?.id);
+      } catch { throw ownershipError(); }
+    }
+    if (name === config.worker_name) continue;
+    if (!isDrill && instance === config.instance_id) throw new Error('Selected instance identity is claimed by another Worker; inspect project Worker settings');
+    if (bot === config.expected_bot_id) throw new Error('Expected Bot is already bound to another project Worker');
+    if (chat === config.admin_chat_id) throw new Error('Admin Forum is already used by another project instance; select a separate Forum group in this Environment INSTANCE_CONFIG_JSON');
+  }
+}
+
+const resourceIdentifier = /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/;
+
+/** Validate the complete inventory before the first create, including partial initialization. */
+export function planInstanceResources(config, { databases, queues }, { operation, provision, workerExists = false, initializationLockHeld = false }) {
+  const resources = [
+    { field: 'd1_id', collection: databases, nameKey: 'name', name: config.d1_name, idKey: 'uuid', path: '/d1/database', body: { name: config.d1_name, primary_location_hint: 'apac', read_replication: { mode: 'disabled' } } },
+    { field: 'queue_id', collection: queues, nameKey: 'queue_name', name: config.queue_name, idKey: 'queue_id', path: '/queues', body: { queue_name: config.queue_name } },
+    { field: 'dlq_id', collection: queues, nameKey: 'queue_name', name: config.dlq_name, idKey: 'queue_id', path: '/queues', body: { queue_name: config.dlq_name } },
+  ];
+  const missingIds = [];
+  for (const resource of resources) {
+    const existing = resource.collection.filter(item => item[resource.nameKey] === resource.name);
+    if (existing.length > 1) throw new Error(`Ambiguous instance resource: ${resource.field}; inspect account inventory`);
+    if (existing.length) {
+      resource.id = existing[0][resource.idKey];
+      if (!config[resource.field]) missingIds.push(resource.field);
+      else if (resource.id !== config[resource.field]) throw new Error(`Existing resource does not match configured ${resource.field}; no automatic adoption`);
+      if (!resourceIdentifier.test(resource.id ?? '')) throw new Error(`Resource inventory has an invalid identifier: ${resource.field}`);
+    } else if (config[resource.field]) throw new Error(`Configured ${resource.field} was not found under the expected resource name; inspect actual state before retrying`);
+    delete resource.collection;
+  }
+  if (missingIds.length) throw new Error(`Exact IDs must be filled back for existing resources: ${missingIds.join(', ')}. Read IDs from Cloudflare, update only this Environment INSTANCE_CONFIG_JSON, then rerun; same-name resources are never adopted automatically`);
+  const absent = resources.filter(resource => !resource.id);
+  if (absent.length && workerExists) throw new Error(`Existing Worker has missing resources: ${absent.map(resource => resource.field).join(', ')}; inspect resource state, do not recreate an established instance`);
+  if (absent.length && (operation !== 'deploy' || provision !== true)) throw new Error(`Instance resources are absent: ${absent.map(resource => resource.field).join(', ')}; first or partial initialization requires deploy with provision enabled`);
+  if (absent.length && initializationLockHeld !== true) throw new Error('Resource initialization requires the Actions account initialization lock; rerun deploy with provision enabled through the current main workflow');
+  if (!workerExists && operation === 'deploy' && (provision !== true || initializationLockHeld !== true)) throw new Error('First or partial Worker initialization requires deploy with provision enabled and the Actions account initialization lock, including when resource IDs are already filled back');
+  if (!workerExists && operation !== 'deploy') throw new Error('Selected Worker is absent; inspect first or partial initialization state before a maintenance operation');
+  return resources;
+}
+
+export async function assertPlannedQueueOwnership(resources, cf, account, workerName) {
+  for (const resource of resources.filter(item => item.id && item.idKey === 'queue_id')) {
+    const queue = (await cf(`${account}/queues/${resource.id}`)).result;
+    if (queue?.queue_id !== resource.id || queue.queue_name !== resource.name) throw new Error('Queue identity changed during preflight');
+    if ((queue.consumers_total_count ?? 0) > (queue.consumers?.length ?? 0)) throw new Error('Queue consumer inventory is incomplete');
+    if ((queue.producers_total_count ?? 0) > (queue.producers?.length ?? 0)) throw new Error('Queue producer inventory is incomplete');
+    if (resource.field === 'dlq_id' && queue.consumers?.length) throw new Error('Dead letter queue must not have an automatic consumer');
+    assertQueueConsumers(queue.consumers, workerName);
+    if (queue.producers?.some(producer => producer.type !== 'worker' || producer.script !== workerName)) throw new Error('Instance queue has another producer');
+  }
+}
+
+export async function provisionPlannedResources(resources, cf, account, log = console.log) {
+  const ids = {};
+  for (const resource of resources) {
+    let id = resource.id;
+    if (!id) {
+      // A single attempt only. Any unknown response stops before another create.
+      const created = (await cf(`${account}${resource.path}`, { method: 'POST', body: resource.body })).result;
+      id = created?.[resource.idKey];
+      if (!resourceIdentifier.test(id ?? '') || created[resource.nameKey] !== resource.name) throw new Error(`Provisioning result for ${resource.field} did not confirm resource identity; inspect actual state and fill back its exact ID before retrying`);
+      log(`Scoped resource created for ${resource.field}; read its exact Cloudflare ID and fill back this Environment INSTANCE_CONFIG_JSON before another run`);
+    }
+    ids[resource.field] = id;
+  }
+  return ids;
+}
+
 export function assertQueueConsumers(consumers, workerName) {
   for (const consumer of consumers ?? []) {
     // Queue detail responses use `script`; the consumer API also documents
@@ -78,7 +171,7 @@ export function apiClient(token, fetcher = fetch) {
       response = await fetcher(`https://api.cloudflare.com/client/v4${path}`, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30000), redirect: 'error' });
     } catch { throw new Error(`Cloudflare ${method} request result unknown; inspect resource state before retrying`); }
     let data;
-    try { data = await response.json(); } catch { throw new Error(`Cloudflare returned non-JSON response (HTTP ${response.status})`); }
+    try { data = await response.json(); } catch { throw new Error(`Cloudflare returned non-JSON response (HTTP ${response.status}); inspect actual resource state before retrying`); }
     if (!response.ok || data.success !== true) throw new Error(`Cloudflare request rejected (HTTP ${response.status}; codes ${(data.errors ?? []).map(e => e.code).filter(Number.isInteger).join(',')})`);
     return data;
   };

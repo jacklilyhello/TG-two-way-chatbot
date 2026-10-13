@@ -1,6 +1,7 @@
 import { readManifests, validateConfig, validateIsolation } from './instance-config.mjs';
+import { fileURLToPath } from 'node:url';
 try {
-  const manifests = await readManifests();
+  const manifests = await readManifests(fileURLToPath(new URL('../instances', import.meta.url)));
   if (process.env.INSTANCE_ID && !process.env.INSTANCE_CONFIG_JSON) throw new Error('Private INSTANCE_CONFIG_JSON is missing for the selected environment');
   if (process.env.INSTANCE_CONFIG_JSON) {
     const config = validateConfig(JSON.parse(process.env.INSTANCE_CONFIG_JSON), process.env.INSTANCE_ID);

@@ -24,7 +24,8 @@ export function validateConfig(value, expectedInstance) {
 }
 
 export function validateIsolation(configs) {
-  for (const field of ['instance_id', 'expected_bot_id', 'hostname', 'worker_name', 'd1_name', 'queue_name', 'dlq_name', 'd1_id', 'queue_id', 'dlq_id']) {
+  // Forum groups belong to one instance; human administrators may overlap.
+  for (const field of ['instance_id', 'expected_bot_id', 'admin_chat_id', 'hostname', 'worker_name', 'd1_name', 'queue_name', 'dlq_name', 'd1_id', 'queue_id', 'dlq_id']) {
     const values = configs.map(c => c[field]).filter(Boolean);
     if (values.length !== new Set(values).size) throw new Error(`Instances share a protected identity/resource: ${field}`);
   }
