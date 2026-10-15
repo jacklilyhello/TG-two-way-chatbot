@@ -21,7 +21,7 @@ export interface Env {
   INSTANCE_ID: string; EXPECTED_BOT_ID: string; ADMIN_CHAT_ID: string; ADMIN_IDS: string;
   VERSION: string; PAUSED?: string; RECOVERY_EPOCH: string;
 }
-export interface UserRow {tgid: string; first_name: string; last_name: string; username: string | null; first_contact: number; blocked: number; thread_id: number | null; binding_version: number; card_id: number | null; photo_id: string | null}
+export interface UserRow {tgid: string; first_name: string; last_name: string; username: string | null; first_contact: number; blocked: number; moderation_version?: number; thread_id: number | null; binding_version: number; card_id: number | null; photo_id: string | null}
 export interface Job {id: number; dedupe: string; user_key: string; kind: string; payload: string; state: string; due_at: number; attempts: number; epoch: string; created_at: number}
 export interface MessageRow {id: number; user_id: string; direction: string; source_chat: string; source_id: number; admin_id: number | null; private_id: number | null; thread_id: number | null; business: number; media_group: string | null; received_at: number; version: number; delivery: string; deletion: string; tombstone: number; payload: string; epoch: string}
 export type Params = Record<string, unknown>;

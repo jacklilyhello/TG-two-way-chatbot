@@ -5,6 +5,7 @@ import {handleAdmin,handleCard} from './admin';
 import {handleMessage,clearConversation,handleReaction,handleDeliveryNotice,handleDeliveryRetry} from './messaging';
 import {user} from './db';
 import {flushLogs,bootstrap} from './logs';
+import {handleBanNotice} from './moderation';
 export class ConversationCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
@@ -86,6 +87,7 @@ export class ConversationCoordinator {
 }
 export async function execute(e:Env,j:Job,waitUntil?:(promise:Promise<unknown>)=>void) {
  const p=JSON.parse(j.payload);
+ if(j.kind==='ban-notice'){await handleBanNotice(e,j,waitUntil);return;}
  if(j.kind==='card'){await handleCard(e,j);return;}
  if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j,waitUntil);return;}
  if(j.kind==='delivery-retry'){await handleDeliveryRetry(e,j,waitUntil);return;}

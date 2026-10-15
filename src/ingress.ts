@@ -27,7 +27,7 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
  } else if(cb&&String(cb.message?.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,cb.from.id)) {
   const token=cb.data?.match(/^a:([a-f0-9]{32})$/)?.[1];
   if(token) action=await one<Action>(e,'SELECT * FROM callback_actions WHERE token=?',token);
-  if(action) {uid=action.user_id;key=uid;current=await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid);}
+  if(action) {uid=action.user_id;key=uid||'admin';current=uid?await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid):null;}
   else key='admin';
  }
  const privateAdmission:PrivateAdmission|undefined=m&&uid&&dir==='in'?{instance:e.INSTANCE_ID,userId:uid,thread:current?.thread_id??null,version:current?.binding_version??0,blocked:current?.blocked===1}:undefined;

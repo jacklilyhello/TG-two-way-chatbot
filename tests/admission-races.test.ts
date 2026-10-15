@@ -149,7 +149,7 @@ describe('goal regression: current policy at the final external request boundary
   const requests:{method:string;params:Record<string,unknown>}[]=[];
   e.BOT={idFromName:()=>e.INSTANCE_ID,get:()=>({fetch:async(_url:string,init:RequestInit)=>{
    const request=JSON.parse(String(init.body));requests.push(request);
-   const result=request.method==='getChat'?{id:20001,first_name:'Synthetic'}:request.method==='createForumTopic'?{message_thread_id:40}:{message_id:1000+Number(request.params.message_id)};
+   const result=request.method==='getChat'?{id:20001,first_name:'Synthetic'}:request.method==='createForumTopic'?{message_thread_id:40}:request.method==='sendMessage'?{message_id:700}:request.method==='pinChatMessage'?true:{message_id:1000+Number(request.params.message_id)};
    return Response.json({status:'success',result});
   }})} as unknown as DurableObjectNamespace;
   await execute(e,first);await execute(e,second);
