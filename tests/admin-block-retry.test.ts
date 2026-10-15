@@ -63,6 +63,23 @@ describe('administrator block mutation retry boundaries',()=>{
   expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:0});
   expect(await all(e,'SELECT event FROM audit_logs')).toEqual([{event:'user_blocked'}]);
  });
+ it.each([0,1])('acknowledges a repeated click with current state %s without masking the first result',async(current)=>{
+  const e=await setup('card_block',0),answers:Params[]=[];
+  const original=e.BOT;
+  e.BOT={idFromName:(name:string)=>original.idFromName(name),get:(id:DurableObjectId)=>({fetch:async(url:string,init:RequestInit)=>{
+   const body=JSON.parse(String(init.body));if(body.method==='answerCallbackQuery')answers.push(body.params);
+   return original.get(id).fetch(url,init);
+  }})} as unknown as DurableObjectNamespace;
+  await handleAdmin(e,job,callback);
+  await run(e,"UPDATE users SET blocked=? WHERE tgid='20001'",current);
+  const duplicate={...callback,update_id:id+1,callback_query:{...callback.callback_query!,id:'synthetic-repeat-callback'}};
+  await handleAdmin(e,{...job,id:id+1},duplicate);
+  expect(answers[0].show_alert).toBe(true);
+  expect(answers.at(-1)).toMatchObject({show_alert:false,text:`此操作已处理；当前${current?'已封禁':'已解除封禁'}，请使用最新资料卡。`});
+  expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:current});
+  expect(await all(e,'SELECT event FROM audit_logs')).toEqual([{event:'user_blocked'}]);
+  expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE kind='ban-notice'")).toEqual({n:1});
+ });
  it('consumes a valid already-satisfied action without inventing another state change audit',async()=>{
   const e=await setup('card_block',1);await handleAdmin(e,job,callback);
   expect(await one(e,'SELECT used FROM callback_actions WHERE token=?',token)).toEqual({used:id+1});

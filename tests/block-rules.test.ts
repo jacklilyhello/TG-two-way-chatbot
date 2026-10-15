@@ -141,7 +141,7 @@ describe('persistent administrator block rules',()=>{
   expect(payload).toMatchObject({instance:e.INSTANCE_ID,id:1,version:1,messageId:901});
   expect(await handleRuleAction(e,job(123),action,payload,124,'20001')).toBe('无权操作。');
   await changeBlockRule(e,job(124),'10001',1,'off');
-  expect(await handleRuleAction(e,job(125),action,payload,126,'10001')).toBe('规则已变化，请使用最新列表。');
+  expect(await handleRuleAction(e,job(125),action,payload,126,'10001')).toBe('规则已变化，本次未更新；请使用最新列表。');
   expect(await one(e,'SELECT enabled,version FROM block_rules WHERE id=1')).toEqual({enabled:0,version:2});
  });
  it('confirms deletion through an actor scoped original-message token and retains only a soft deleted rule',async()=>{
@@ -150,7 +150,7 @@ describe('persistent administrator block rules',()=>{
   await handleRuleAction(e,job(132),action,JSON.parse(action.payload),133,'10001');
   const confirm=(await one<RuleAction>(e,"SELECT * FROM callback_actions WHERE kind='rule_delete_confirm'"))!;
   expect(JSON.parse(confirm.payload)).toMatchObject({messageId:902,instance:e.INSTANCE_ID});
-  expect(await handleRuleAction(e,job(133),confirm,JSON.parse(confirm.payload),134,'10001')).toBe('规则已更新。');
+  expect(await handleRuleAction(e,job(133),confirm,JSON.parse(confirm.payload),134,'10001')).toBe('拦截规则 #1 已删除。');
   expect(await one<BlockRule>(e,'SELECT * FROM block_rules WHERE id=1')).toMatchObject({deleted:1,enabled:0});
   expect((await one<RuleAction>(e,'SELECT * FROM callback_actions WHERE token=?',confirm.token))!.used).toBe(134);
  });

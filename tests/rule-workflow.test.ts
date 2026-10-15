@@ -153,9 +153,9 @@ describe('interactive rule management',()=>{
   expect((await ruleSession(e,'10001'))!.revision).toBe(3);await handleRuleInput(e,j,update);
   expect((await ruleSession(e,'10001'))!.revision).toBe(3);await click(e,124,'rule_add_confirm');expect(await all(e,'SELECT id FROM block_rules')).toHaveLength(1);
  });
- it('recovers a rate limited save receipt from its committed mutation and never duplicates the rule',async()=>{
+ it('recovers a rate limited combined result list from its committed mutation and never duplicates the rule',async()=>{
   let limited=true;const {e}=client(request=>{
-   if(request.key.endsWith('job:134:rules:add')&&limited){limited=false;return Response.json({due:now()+1},{status:429});}
+   if(request.key.endsWith('job:134:rules:0')&&limited){limited=false;return Response.json({due:now()+1},{status:429});}
    return Response.json({status:'success',result:{message_id:901}});
   });await begin(e,130);await input(e,133,'committed');const confirm=await latest(e,'rule_add_confirm'),payload=JSON.parse(confirm.payload);
   await expect(handleRuleAction(e,job(134),confirm,payload,135,'10001')).rejects.toBeInstanceOf(RetryLater);
@@ -222,5 +222,57 @@ describe('interactive rule management',()=>{
   await handleAdmin(e,j,update);expect(await ruleSession(e,'10001')).toMatchObject({stage:'type',revision:1});
   expect(requests.filter(request=>request.key.includes(`job:${targetJob}:rules:draft:1`))).toHaveLength(2);
   expect(String(requests.at(-1)!.params.text)).toContain('请选择规则类型');
+ });
+ it.each(['rule_add_confirm','rule_delete_confirm'])('acknowledges committed %s before sending one combined result and refreshed list',async kind=>{
+  const order:string[]=[];let confirming=false;
+  const {e,requests}=client(request=>{if(confirming&&request.method==='sendMessage')order.push('list');return Response.json({status:'success',result:{message_id:901}});});
+  if(kind==='rule_add_confirm'){await begin(e,200);await input(e,203,'single-result');}
+  else {await addBlockRule(e,job(200),'10001','keyword','single-result');await rulesPanel(e,job(201),'10001');await click(e,202,'rule_delete');await input(e,203,'1');}
+  const action=await latest(e,kind),before=requests.length;confirming=true;
+  await handleRuleAction(e,job(204),action,JSON.parse(action.payload),205,'10001',undefined,undefined,async text=>{
+   expect(await one(e,'SELECT deleted FROM block_rules')).toEqual({deleted:kind==='rule_delete_confirm'?1:0});
+   expect((await ruleSession(e,'10001'))!.stage).toBe('done');
+   expect(text).toContain(kind==='rule_add_confirm'?'已添加并启用':'已删除');order.push('ack');
+  });
+  expect(order).toEqual(['ack','list']);
+  const sends=requests.slice(before).filter(request=>request.method==='sendMessage');expect(sends).toHaveLength(1);
+  expect(String(sends[0].params.text)).toContain(kind==='rule_add_confirm'?'已添加并启用':'已删除');
+  expect(String(sends[0].params.text)).toContain(`当前有效 ${kind==='rule_add_confirm'?1:0} 条`);
+ });
+ it('acknowledges a stale deletion as an explicit failure and includes that outcome in the updated list',async()=>{
+  const {e,requests}=client();await addBlockRule(e,job(210),'10001','keyword','retained');await rulesPanel(e,job(211),'10001');await click(e,212,'rule_delete');await input(e,213,'1');
+  const action=await latest(e,'rule_delete_confirm');await changeBlockRule(e,job(214),'10002',1,'off');const before=requests.length,outcomes:string[]=[];
+  await handleRuleAction(e,job(215),action,JSON.parse(action.payload),216,'10001',undefined,undefined,async text=>{outcomes.push(text);});
+  expect(outcomes).toEqual(['规则已变化，本次未删除；请使用最新列表。']);
+  expect(await one(e,'SELECT deleted FROM block_rules')).toEqual({deleted:0});
+  const sends=requests.slice(before).filter(request=>request.method==='sendMessage');expect(sends).toHaveLength(1);expect(String(sends[0].params.text)).toContain('本次未删除');
+ });
+ it.each(['failed','unknown'])('reports a %s result-list delivery without repeating its original send or mutation',async status=>{
+  const {e,requests}=client(request=>request.key.endsWith('job:224:rules:0')?Response.json({status,reason:'synthetic list delivery outcome'}):Response.json({status:'success',result:{message_id:901}}));
+  await begin(e,220);await input(e,223,'committed-even-if-list-unavailable');const action=await latest(e,'rule_add_confirm'),payload=JSON.parse(action.payload),before=requests.length;
+  const result=await handleRuleAction(e,job(224),action,payload,225,'10001',undefined,undefined,async text=>{expect(text).toContain('已添加并启用');});
+  expect(result).toContain(status==='unknown'?'发送结果未知，不会自动重发':'发送失败');
+  expect(requests.slice(before).filter(request=>request.key.endsWith('job:224:rules:0'))).toHaveLength(1);
+  expect(String(requests.at(-1)!.params.text)).toContain('请重新打开');const after=requests.length;
+  await handleRuleAction(e,job(224),action,payload,225,'10001');expect(requests).toHaveLength(after);
+  expect(await all(e,'SELECT id FROM block_rules')).toHaveLength(1);expect(await all(e,"SELECT id FROM audit_logs WHERE event='block_rule_created'")).toHaveLength(1);
+ });
+ it('keeps every batch-created list token stable, actor scoped, message bound and expired on replay',async()=>{
+  const {e}=client();for(let i=0;i<5;i++)await addBlockRule(e,job(230+i),'10001','keyword',`batch-rule-${i}`);
+  await rulesPanel(e,job(235),'10001');const first=await all<RuleAction>(e,'SELECT * FROM callback_actions ORDER BY rowid');expect(first).toHaveLength(14);
+  for(const action of first)expect(JSON.parse(action.payload)).toMatchObject({instance:e.INSTANCE_ID,messageId:901});
+  await run(e,'UPDATE callback_actions SET expires_at=?',now()-1);const expired=await all<RuleAction>(e,'SELECT * FROM callback_actions ORDER BY rowid');
+  await rulesPanel(e,job(235),'10001');expect(await all<RuleAction>(e,'SELECT * FROM callback_actions ORDER BY rowid')).toEqual(expired);
+  await rulesPanel(e,job(237),'10002');const second=await all<RuleAction>(e,'SELECT * FROM callback_actions WHERE actor_id=? ORDER BY rowid','10002');expect(second).toHaveLength(14);
+  expect(second.every(action=>!first.some(previous=>previous.token===action.token))).toBe(true);
+  const old=expired[0];expect(await handleRuleAction(e,job(236),old,JSON.parse(old.payload),237,'10001')).toBe('按钮已失效。');
+ });
+ it('answers the real administrator confirmation once as a toast before its combined result list',async()=>{
+  const {e,requests}=client();await begin(e,240);await input(e,243,'early-real-dispatcher-feedback');const action=await latest(e,'rule_add_confirm'),before=requests.length;
+  const update:TGUpdate={update_id:244,callback_query:{id:'confirm-244',from:{id:10001},data:`a:${action.token}`,message:{...message(e,JSON.parse(action.payload).messageId,''),from:{id:Number(e.EXPECTED_BOT_ID),is_bot:true}}}};
+  await handleAdmin(e,job(244),update);
+  const feedback=requests.slice(before);expect(feedback.map(request=>request.method)).toEqual(['answerCallbackQuery','sendMessage']);
+  expect(feedback[0].params).toMatchObject({callback_query_id:'confirm-244',show_alert:false,text:'拦截规则 #1 已添加并启用。'});
+  expect(String(feedback[1].params.text)).toContain('当前有效 1 条');
  });
 });
