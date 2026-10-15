@@ -1,6 +1,6 @@
 import type {Env, Job, Params, TGMessage, TGUpdate} from './types';
 import {all, logEpochStatements, logOutboxStatements, now, one, run, setting, stmt, wakeLogs} from './db';
-import {notify} from './operations';
+import {notify,type Outcome} from './operations';
 import {captureRuleInput,closeRuleSession,moveRuleSession,ruleInputEligible,ruleSession,startRuleSession,type RuleInputAdmission,type RuleSession} from './rule-workflow';
 export {captureRuleInput} from './rule-workflow';
 
@@ -8,6 +8,7 @@ export const RULE_LIMITS = {rules:50, pattern:200, field:8192, states:128, total
 export interface BlockRule {id:number;kind:'keyword'|'regex';pattern:string;enabled:number;deleted:number;version:number;state_count:number}
 export interface RuleAction {token:string;kind:string;actor_id:string;thread_id:number|null;used:number;expires_at:number;payload:string}
 type Button = {text:string;callback_data:string};
+interface ButtonSpec {text:string;kind:string;payload:Params}
 type CharTest = {kind:'literal';value:string}|{kind:'any'}|{kind:'range';from:number;to:number}|{kind:'set';items:CharTest[];negated:boolean}|{kind:'digit'|'word'|'space';negated:boolean};
 type Node = {kind:'empty'}|{kind:'char';test:CharTest}|{kind:'start'|'end'}|{kind:'sequence'|'alternate';nodes:Node[]}|{kind:'repeat';node:Node;min:number;max:number|null};
 interface State {kind:'char'|'split'|'start'|'end'|'match';next:number;other?:number;test?:CharTest}
@@ -224,37 +225,48 @@ export async function changeBlockRule(e:Env,job:Job,actor:string,id:number,opera
  return (await one<Mutation>(e,'SELECT rule_id,result FROM block_rule_mutations WHERE op_key=?',key))!;
 }
 
-async function button(e:Env,job:Job,actor:string,label:string,kind:string,payload:Params):Promise<Button> {
- const context=`rules:${job.id}:${kind}:${JSON.stringify(payload)}`;
- const old=await one<{token:string}>(e,"SELECT token FROM callback_actions WHERE kind=? AND actor_id=? AND thread_id IS NULL AND json_extract(payload,'$.context')=? AND json_extract(payload,'$.instance')=?",kind,actor,context,e.INSTANCE_ID);
- const token=old?.token??crypto.randomUUID().replace(/-/g,'');
- if(!old)await run(e,'INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) VALUES(?,?,?, ?,NULL,0,?,?)',token,kind,'',actor,JSON.stringify({...payload,context,instance:e.INSTANCE_ID}),now()+15*60_000);
- return {text:label,callback_data:`a:${token}`};
+async function buttonRows(e:Env,job:Job,actor:string,rows:ButtonSpec[][]):Promise<Button[][]> {
+ const specs=rows.flat().map(spec=>({...spec,context:`rules:${job.id}:${spec.kind}:${JSON.stringify(spec.payload)}`,token:crypto.randomUUID().replace(/-/g,'')}));
+ if(!specs.length)return [];
+ // One transaction and round trip creates all missing controls and reads the
+ // winners. Replays keep the original token, expiry and message binding.
+ const results=await e.DB.batch([
+  ...specs.map(spec=>stmt(e,"INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) SELECT ?,?,'',?,NULL,0,?,? WHERE NOT EXISTS(SELECT 1 FROM callback_actions WHERE kind=? AND actor_id=? AND thread_id IS NULL AND json_extract(payload,'$.context')=? AND json_extract(payload,'$.instance')=?)",spec.token,spec.kind,actor,JSON.stringify({...spec.payload,context:spec.context,instance:e.INSTANCE_ID}),now()+15*60_000,spec.kind,actor,spec.context,e.INSTANCE_ID)),
+  stmt(e,`SELECT token,json_extract(payload,'$.context') context FROM callback_actions WHERE actor_id=? AND thread_id IS NULL AND json_extract(payload,'$.instance')=? AND json_extract(payload,'$.context') IN (${specs.map(()=>'?').join(',')}) ORDER BY rowid`,actor,e.INSTANCE_ID,...specs.map(spec=>spec.context))
+ ]);
+ const tokens=new Map<string,string>();
+ for(const row of results.at(-1)!.results as unknown as {token:string;context:string}[])if(!tokens.has(row.context))tokens.set(row.context,row.token);
+ let index=0;return rows.map(row=>row.map(spec=>({text:spec.text,callback_data:`a:${tokens.get(specs[index++].context)!}`})));
 }
-export async function rulesPanel(e:Env,job:Job,actor:string,page=0):Promise<void> {
+async function button(e:Env,job:Job,actor:string,label:string,kind:string,payload:Params):Promise<Button> {
+ return (await buttonRows(e,job,actor,[[{text:label,kind,payload}]]))[0][0];
+}
+export async function rulesPanel(e:Env,job:Job,actor:string,page=0,notice?:string):Promise<Outcome|undefined> {
  if(!allowed(e,actor))return;
  await closeRuleSession(e,actor);
  const active=await activeBlockRules(e),count=active.length,saved=(await one<{n:number}>(e,'SELECT COUNT(*) n FROM block_rules WHERE deleted=0'))!.n;
  const maxPage=Math.max(0,Math.ceil(count/5)-1);page=Math.min(maxPage,Math.max(0,Number.isFinite(page)?Math.floor(page):0));
  const rows=active.slice(page*5,page*5+5);
  const lines=rows.map(rule=>`#${rule.id} · ${rule.kind==='keyword'?'关键词':'正则'}\n${rule.pattern}`);
- const buttons:Button[][]=[];
- for(const rule of rows)buttons.push([
-  await button(e,job,actor,`#${rule.id} ${rule.enabled?'停用':'启用'}`,'rule_change',{id:rule.id,version:rule.version,operation:rule.enabled?'off':'on',page}),
-  await button(e,job,actor,`#${rule.id} 删除`,'rule_delete_prompt',{id:rule.id,version:rule.version,page})
+ const controls:ButtonSpec[][]=[];
+ for(const rule of rows)controls.push([
+  {text:`#${rule.id} ${rule.enabled?'停用':'启用'}`,kind:'rule_change',payload:{id:rule.id,version:rule.version,operation:rule.enabled?'off':'on',page}},
+  {text:`#${rule.id} 删除`,kind:'rule_delete_prompt',payload:{id:rule.id,version:rule.version,page}}
  ]);
- const navigation:Button[]=[];
- if(page>0)navigation.push(await button(e,job,actor,'上一页','rule_page',{page:page-1}));
- if(page<maxPage)navigation.push(await button(e,job,actor,'下一页','rule_page',{page:page+1}));
- if(navigation.length)buttons.push(navigation);
- buttons.push([await button(e,job,actor,'添加规则','rule_add',{}),await button(e,job,actor,'删除规则','rule_delete',{})]);
- buttons.push([await button(e,job,actor,'规则说明','rule_help',{}),await button(e,job,actor,'返回主面板','rule_main',{})]);
- const text=`拦截规则 · ${page+1}/${maxPage+1} · 当前有效 ${count} 条\n只展示已启用且有效的规则。关键词忽略大小写，正则区分大小写。\n\n${lines.join('\n\n')||'当前没有已启用且有效的规则。'}\n\n已保存 ${saved}/${RULE_LIMITS.rules} 条${saved>count?`，其中 ${saved-count} 条停用或无效（原数据保留；删除时可输入其编号）`:''}。\n点击下方按钮逐步添加或删除。命中即封禁；用户端静默。停用或删除规则不会自动解除已有封禁。`;
- await sendRulePanel(e,`job:${job.id}:rules:${page}`,text,buttons);
+ const navigation:ButtonSpec[]=[];
+ if(page>0)navigation.push({text:'上一页',kind:'rule_page',payload:{page:page-1}});
+ if(page<maxPage)navigation.push({text:'下一页',kind:'rule_page',payload:{page:page+1}});
+ if(navigation.length)controls.push(navigation);
+ controls.push([{text:'添加规则',kind:'rule_add',payload:{}},{text:'删除规则',kind:'rule_delete',payload:{}}]);
+ controls.push([{text:'规则说明',kind:'rule_help',payload:{}},{text:'返回主面板',kind:'rule_main',payload:{}}]);
+ const buttons=await buttonRows(e,job,actor,controls);
+ const text=`${notice?`${notice}\n\n`:''}拦截规则 · ${page+1}/${maxPage+1} · 当前有效 ${count} 条\n只展示已启用且有效的规则。关键词忽略大小写，正则区分大小写。\n\n${lines.join('\n\n')||'当前没有已启用且有效的规则。'}\n\n已保存 ${saved}/${RULE_LIMITS.rules} 条${saved>count?`，其中 ${saved-count} 条停用或无效（原数据保留；删除时可输入其编号）`:''}。\n点击下方按钮逐步添加或删除。命中即封禁；用户端静默。停用或删除规则不会自动解除已有封禁。`;
+ return sendRulePanel(e,`job:${job.id}:rules:${page}`,text,buttons);
 }
 async function sendRulePanel(e:Env,key:string,text:string,buttons:Button[][]) {
  const result=await notify(e,key,null,text,{reply_markup:{inline_keyboard:buttons}});
  if(result.status==='success')await e.DB.batch(buttons.flat().map(b=>stmt(e,"UPDATE callback_actions SET payload=json_set(payload,'$.messageId',?) WHERE token=?",result.result.message_id,b.callback_data.slice(2))));
+ return result;
 }
 async function ruleHelp(e:Env,job:Job) {
  await notify(e,`job:${job.id}:rules:help`,null,'拦截规则用法（仅限管理员在 General）\n\n/mb rules 查看规则\n/mb rules add keyword 广告关键词\n关键词按原文子串匹配，忽略大小写；空格及换行按实际文字保留。\n/mb rules add regex (优惠|推广)\\s*[0-9]+\n正则按子串匹配且区分大小写；^ / $ 表示整条文字的开头 / 结尾。支持 .、[]、()、|、*、+、?、{m,n}、\\d、\\w、\\s。无需 / 分隔符；不支持前后查找、回溯引用、内联标志或 flags。\n/mb rules on 规则编号\n/mb rules off 规则编号\n/mb rules delete 规则编号\n列表按钮也可启用、停用或确认删除。\n\n匹配用户每条文字和媒体说明（分别最多前 8192 字符），含编辑；不检查附件文件内容、图片文字、姓名或用户名。最多 50 条规则、10 条正则、每条 200 字符；有限重复最多 40 次，复杂度总量受限，拒绝能匹配空串的正则。规则及封禁状态保存在当前机器人的独立数据库。命中后用户端静默；解除封禁需在资料面板操作。');
@@ -358,9 +370,23 @@ export async function handleRuleCommand(e:Env,job:Job,actor:string,rawArgs:strin
  }
  await ruleHelp(e,job);
 }
+async function confirmedRulePanel(e:Env,job:Job,actor:string,page:number,message:string,onCommitted?:((text:string)=>Promise<void>)):Promise<string> {
+ await closeRuleSession(e,actor);
+ // The result is already committed in D1. Answer the originating callback
+ // before constructing controls or waiting on the Telegram list send.
+ if(onCommitted)await onCommitted(message);
+ const panel=await rulesPanel(e,job,actor,page,message);
+ if(panel&&panel.status!=='success') {
+  const feedback=`${message}\n更新规则列表${panel.status==='unknown'?'发送结果未知，不会自动重发':'发送失败'}。请重新打开“拦截规则”查看已保存状态。`;
+  // This is a distinct delivery-status notice, never a replay of an unknown
+  // list send. Its own ledger key also prevents duplicate notices on recovery.
+  await notify(e,`job:${job.id}:rules:panel-delivery`,null,feedback);return feedback;
+ }
+ return message;
+}
 /** Called only after the administrator callback's existing actor, bot, chat,
  * instance, expiry, General and original message checks have succeeded. */
-export async function handleRuleAction(e:Env,job:Job,action:RuleAction,payload:Params,stamp:number,actor:string,waitUntil?:((promise:Promise<unknown>)=>void),showMain?:()=>Promise<void>):Promise<string> {
+export async function handleRuleAction(e:Env,job:Job,action:RuleAction,payload:Params,stamp:number,actor:string,waitUntil?:((promise:Promise<unknown>)=>void),showMain?:()=>Promise<void>,onCommitted?:((text:string)=>Promise<void>)):Promise<string> {
  if(!allowed(e,actor)||action.actor_id!==actor||action.thread_id!==null)return '无权操作。';
  if(payload.instance!==e.INSTANCE_ID||action.expires_at<now()||(action.used!==0&&action.used!==stamp))return '按钮已失效。';
  const page=Number(payload.page)||0;
@@ -376,17 +402,15 @@ export async function handleRuleAction(e:Env,job:Job,action:RuleAction,payload:P
   const draft=session?JSON.parse(session.payload) as Params:{};
   const result=mutation??await addBlockRule(e,job,actor,draft.kind as 'keyword'|'regex',String(draft.pattern),waitUntil,action,stamp);
   const message=result.result==='created'?`拦截规则 #${result.rule_id} 已添加并启用。`:result.result==='limit'?'未保存：规则数量或正则复杂度总量已达上限，请删除不再需要的规则后重试。':'流程已变化，规则未保存。';
-  await closeRuleSession(e,actor);
-  await notify(e,`job:${job.id}:rules:add`,null,message);
-  await rulesPanel(e,job,actor);return message;
+  return confirmedRulePanel(e,job,actor,0,message,onCommitted);
  }
  if(action.kind==='rule_change'||action.kind==='rule_delete_confirm') {
   const id=ruleId(String(payload.id)),operation=action.kind==='rule_delete_confirm'?'delete':payload.operation;
   if(workflow&&!mutation&&session?.stage!=='confirm_delete')return '按钮已失效。';
   if(!id||!['on','off','delete'].includes(String(operation))||!Number.isSafeInteger(payload.version))return '按钮已失效。';
   const result=mutation??await changeBlockRule(e,job,actor,id,operation as 'on'|'off'|'delete',Number(payload.version),action,stamp,waitUntil);
-  if(workflow)await notify(e,`job:${job.id}:rules:delete`,null,result.result==='finished'?`拦截规则 #${id} 已删除。`:'规则已变化，本次未删除；请重新选择编号。');
-  await rulesPanel(e,job,actor,page);return result.result==='finished'?'规则已更新。':'规则已变化，请使用最新列表。';
+  const message=result.result==='finished'?`拦截规则 #${id} 已${operation==='delete'?'删除':operation==='on'?'启用':'停用'}。`:`规则已变化，本次未${operation==='delete'?'删除':'更新'}；请使用最新列表。`;
+  return confirmedRulePanel(e,job,actor,page,message,onCommitted);
  }
  await run(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0',stamp,action.token);
  if(action.kind==='rule_add'||action.kind==='rule_delete') {

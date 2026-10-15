@@ -149,12 +149,22 @@ function cardText(u: UserRow, timezone: string, noticeWarning='') {
 const cardSignature = (u: UserRow, timezone: string) => JSON.stringify(['profile-v2',u.card_id,u.first_name,u.last_name,u.username,u.first_contact,u.photo_id,u.blocked,u.moderation_version ?? 0,timezone]);
 const cardDigest = async(value:string)=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))).map(byte=>byte.toString(16).padStart(2,'0')).join('');
 async function keyboard(e: Env, job: Job, u: UserRow, context = `card:${job.id}`) {
- const block = await createAction(e,u.blocked ? 'card_unblock' : 'card_block',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
- const clear = await createAction(e,'card_clear',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
+ const blockKind=u.blocked?'card_unblock':'card_block';
+ const kinds=[blockKind,'card_clear',...PROFILE_ENTRIES.map(({entry})=>`card_profile_${entry}`)];
+ const where="kind=? AND user_id=? AND actor_id='*' AND thread_id IS ? AND version=? AND json_extract(payload,'$.context')=? AND used=0";
+ // All five controls belong to the same render. Create and recover them in
+ // one transaction instead of delaying a state edit with five D1 round trips.
+ const results=await e.DB.batch([
+  ...kinds.map(kind=>stmt(e,`INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) SELECT ?,?,?,'*',?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM callback_actions WHERE ${where})`,crypto.randomUUID().replace(/-/g,''),kind,u.tgid,u.thread_id,u.binding_version,JSON.stringify({instance:e.INSTANCE_ID,context}),Number.MAX_SAFE_INTEGER,kind,u.tgid,u.thread_id,u.binding_version,context)),
+  stmt(e,`SELECT token,kind FROM callback_actions WHERE user_id=? AND actor_id='*' AND thread_id IS ? AND version=? AND json_extract(payload,'$.context')=? AND used=0 AND kind IN (${kinds.map(()=>'?').join(',')}) ORDER BY rowid`,u.tgid,u.thread_id,u.binding_version,context,...kinds)
+ ]);
+ const tokens=new Map<string,string>();
+ for(const row of results.at(-1)!.results as unknown as {token:string;kind:string}[])if(!tokens.has(row.kind))tokens.set(row.kind,row.token);
+ const block=tokens.get(blockKind)!,clear=tokens.get('card_clear')!;
  const callbacks={} as ProfileCallbacks;
  const profileTokens:string[]=[];
  for(const {entry} of PROFILE_ENTRIES) {
-  const token=await createAction(e,`card_profile_${entry}`,u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
+  const token=tokens.get(`card_profile_${entry}`)!;
   callbacks[entry]='a:'+token;profileTokens.push(token);
  }
  const links = profileLinks(u);
@@ -232,7 +242,7 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  if(!u?.thread_id)return;
  const boundVersion=u.binding_version,boundThread=u.thread_id;
  const guard:IssueGuard={threadVersion:{userId:u.tgid,version:boundVersion,threadId:boundThread,moderationVersion:u.moderation_version??0},...(urgent?{priority:'moderation-card' as const}:{})};
- const photoChecked=Number(await setting(e,`profile_checked:${u.tgid}`,'0'));
+ const photoChecked=urgent?0:Number(await setting(e,`profile_checked:${u.tgid}`,'0'));
  if(!urgent&&(force||!photoChecked||now()-photoChecked>=60000)) {
   const photos = await call<{photos:{file_id:string}[][]}>(e,`job:${job.id}:avatar:${userId}`,'getUserProfilePhotos',{user_id:userId,limit:1});
   if (photos.status === 'success') {
@@ -451,8 +461,8 @@ async function confirmation(e: Env, job: Job, u: UserRow, actor: string, thread:
   ]);
  }
 }
-async function answer(e: Env, job: Job, id: string, text: string) {
- await call(e,`job:${job.id}:answer:${id}`,'answerCallbackQuery',{callback_query_id:id,text,show_alert:true});
+async function answer(e: Env, job: Job, id: string, text: string,showAlert=true) {
+ await call(e,`job:${job.id}:answer:${id}`,'answerCallbackQuery',{callback_query_id:id,text,show_alert:showAlert});
 }
 async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise:Promise<unknown>)=>void) {
  const cb = update.callback_query!;
@@ -461,7 +471,8 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  const match = tokenPattern.exec(cb.data ?? '');
  const a = match ? await one<Action>(e,'SELECT * FROM callback_actions WHERE token=?',match[1]) : null;
  const stamp = update.update_id+1;
- if (!a || (a.expires_at<now() && !(a.kind==='clear_confirm' && a.used===stamp)) || (a.actor_id!=='*' && a.actor_id!==String(cb.from.id)) || a.thread_id!==threadOf(m) || (a.used!==0 && a.used!==stamp)) {await answer(e,job,cb.id,'按钮已失效或无权操作。');return;}
+ const completedBan=a&&a.used>0&&(a.kind==='card_block'||a.kind==='card_unblock');
+ if (!a || (a.expires_at<now() && !(a.kind==='clear_confirm' && a.used===stamp)) || (a.actor_id!=='*' && a.actor_id!==String(cb.from.id)) || a.thread_id!==threadOf(m) || (a.used!==0 && a.used!==stamp&&!completedBan)) {await answer(e,job,cb.id,'按钮已失效或无权操作。');return;}
  const payload = actionPayload(a);
  if (payload.instance!==e.INSTANCE_ID) {await answer(e,job,cb.id,'实例不匹配。');return;}
  if (a.kind==='panel') {
@@ -473,11 +484,13 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
   else if (payload.view==='user' && validUserId(String(payload.id))) await userDetail(e,job,String(payload.id));
   else if (payload.view==='settings') await settingsPanel(e,job);
   else if (payload.view==='rules') await rulesPanel(e,job,String(cb.from.id));
-  await answer(e,job,cb.id,'已更新。');return;
+  await answer(e,job,cb.id,'已更新。',false);return;
  }
  if(a.kind.startsWith('rule_')) {
   if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'规则管理仅限原 General 消息。');return;}
-  await answer(e,job,cb.id,await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today')));return;
+  let answered=false;
+  const text=await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today'),async message=>{await answer(e,job,cb.id,message,false);answered=true;});
+  if(!answered)await answer(e,job,cb.id,text,false);return;
  }
  const u = await user(e,a.user_id);
  if (a.kind==='clear_confirm') {
@@ -498,6 +511,9 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  if (a.kind.startsWith('card_')) {
   if (u.thread_id!==a.thread_id || u.card_id!==m.message_id) {await answer(e,job,cb.id,'旧资料卡已失效，请使用当前话题。');return;}
  } else if (payload.messageId!==m.message_id) {await answer(e,job,cb.id,'确认消息不匹配。');return;}
+ if(completedBan&&a.used!==stamp) {
+  await answer(e,job,cb.id,`此操作已处理；当前${u.blocked?'已封禁':'已解除封禁'}，请使用最新资料卡。`,false);return;
+ }
  if (a.kind==='delivery_retry') {
   await answer(e,job,cb.id,await reserveDeliveryRetry(e,job,update,a,u));return;
  }
