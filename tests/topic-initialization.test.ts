@@ -44,7 +44,7 @@ describe('new-topic durable initial card gate',()=>{
   expect(requests.filter(r=>r.method==='sendMessage')).toHaveLength(1);
   expect(requests.filter(r=>r.method==='pinChatMessage')).toHaveLength(1);
   expect(requests.some(r=>r.method==='getUserProfilePhotos')).toBe(false);
-  expect(await all(e,"SELECT kind,COUNT(*) n FROM callback_actions GROUP BY kind ORDER BY kind")).toEqual([{kind:'card_block',n:1},{kind:'card_clear',n:1}]);
+  expect(await all(e,"SELECT kind,COUNT(*) n FROM callback_actions GROUP BY kind ORDER BY kind")).toEqual([{kind:'card_block',n:1},{kind:'card_clear',n:1},{kind:'card_profile_android',n:1},{kind:'card_profile_general',n:1},{kind:'card_profile_ios',n:1}]);
   const current=(await user(e,'20001'))!;
   expect(await setting(e,'card_initial:20001:1')).toBe(`ready:40:${current.card_id}`);
   await refreshCardNow(e,job(4),'20001');

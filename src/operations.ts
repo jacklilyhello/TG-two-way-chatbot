@@ -5,7 +5,7 @@ import type {DeliveryRetryGuard} from './delivery-retry';
 export type Outcome<T = any> = {status: 'success'; result: T; confirmedAt?: number} | {status: 'failed' | 'unknown'; reason: string; code?: number};
 export class RetryLater extends Error { constructor(public due: number) {super('retry_later');} }
 interface Ledger {method: string;phase: string;result: string | null;reason: string | null;code: number | null;updated_at:number}
-export interface IssueGuard {messageIds?:number[];threadVersion?:{userId:string;version:number;threadId?:number};unblockedUser?:string;receipt?:ReceiptGuard;deliveryRetry?:DeliveryRetryGuard}
+export interface IssueGuard {priority?:'moderation-card';messageIds?:number[];threadVersion?:{userId:string;version:number;threadId?:number;moderationVersion?:number};unblockedUser?:string;receipt?:ReceiptGuard;deliveryRetry?:DeliveryRetryGuard}
 interface Timing {transportMs:number;botWaitMs:number;apiMs:number|null}
 function responseTiming(response:Response,started:number):Timing {
  const number=(name:string)=>{const text=response.headers.get(name);const value=Number(text);return text!==null&&Number.isFinite(value)&&value>=0?Math.round(value):null;};

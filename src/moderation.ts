@@ -1,18 +1,26 @@
 import type {Env,Job} from './types';
-import {audit,logEpochStatements,logOutboxStatements,now,one,stmt,user,wakeLogs,wakeWork} from './db';
+import {audit,logEpochStatements,logOutboxStatements,now,one,setting,stmt,user,wakeLogs,wakeWork} from './db';
 import {call,RetryLater} from './operations';
-import {ensureInitialCardReady,ensureThread,scheduleCard} from './admin';
+import {ensureInitialCardReady,ensureThread,scheduleCard,topicLink} from './admin';
 
 export interface MatchedBanRule {id:number;kind:'keyword'|'regex';pattern:string;version:number}
 export interface BanAction {token:string;stamp:number;version:number;threadId:number;cardId:number}
 export interface BanOptions {source:'manual'|'rule';actorId?:string;rule?:MatchedBanRule;action?:BanAction;messageId?:number}
 interface BanEvent {
- id:number;user_id:string;blocked:number;changed:number;source:'manual'|'rule';
+ id:number;event_key:string;user_id:string;blocked:number;changed:number;source:'manual'|'rule';
  rule_id:number|null;rule_kind:'keyword'|'regex'|null;rule_pattern:string|null;rule_version:number|null;
- committed:number;notice_status:'none'|'pending'|'success'|'failed'|'unknown';
+ committed:number;notice_status:'none'|'pending'|'success'|'failed'|'unknown';created_at:number;
 }
 export interface BanResult {applied:boolean;changed:boolean;eventId:number|null}
 const noticeLane=(userId:string)=>`ban:${userId}`;
+function cardRepairStatements(e:Env,userId:string,eventKey:string,time:number,noticeProblem=false):D1PreparedStatement[] {
+ const gate=noticeProblem?"b.notice_status IN ('failed','unknown')":"(b.changed=1 OR b.source='manual')";
+ const dedupe=noticeProblem?'ban-notice-card:':'ban-card:';
+ return [
+  stmt(e,`INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT ?||?||':'||b.id,'card:'||u.tgid,'card',json_object('userId',u.tgid,'version',u.binding_version,'threadId',u.thread_id,'force',json('false'),'urgent',json('true')),'pending',?,?,? FROM ban_events b JOIN users u ON u.tgid=b.user_id WHERE b.event_key=? AND b.committed=1 AND ${gate} AND u.thread_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.user_key='card:'||u.tgid AND j.kind='card' AND j.epoch=? AND j.state IN ('pending','retry') AND json_extract(j.payload,'$.version')=u.binding_version)`,dedupe,e.RECOVERY_EPOCH,time,e.RECOVERY_EPOCH,time,eventKey,e.RECOVERY_EPOCH),
+  stmt(e,`UPDATE jobs SET payload=json_set(payload,'$.urgent',json('true')) WHERE user_key=? AND kind='card' AND epoch=? AND state IN ('pending','retry') AND json_extract(payload,'$.version')=(SELECT binding_version FROM users WHERE tgid=?) AND EXISTS(SELECT 1 FROM ban_events b WHERE b.event_key=? AND b.committed=1 AND ${gate})`,`card:${userId}`,e.RECOVERY_EPOCH,userId,eventKey)
+ ];
+}
 
 /** State, action consumption, audit and notice outbox share one transaction.
  * The immutable event key also seals a no-op, so replaying a previously handled
@@ -39,6 +47,9 @@ export async function setBlocked(e:Env,job:Job,userId:string,blocked:boolean,opt
   ...(action?[stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM ban_events WHERE event_key=? AND committed=0)',action.stamp,action.token,eventKey)]:[]),
   stmt(e,'UPDATE ban_events SET committed=1 WHERE event_key=? AND committed=0',eventKey),
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT 'ban-notice:'||?||':'||id,?,'ban-notice',json_object('eventId',id),'pending',?,?,? FROM ban_events WHERE event_key=? AND committed=1 AND notice_status='pending'",e.RECOVERY_EPOCH,noticeLane(userId),time,e.RECOVERY_EPOCH,time,eventKey),
+  // Commit the visual repair alongside the state transition. A failed wake or
+  // callback acknowledgement cannot leave a changed user without a card job.
+  ...cardRepairStatements(e,userId,eventKey,time),
   ...logOutboxStatements(e,time),
   stmt(e,'SELECT id,changed,committed FROM ban_events WHERE event_key=?',eventKey)
  ];
@@ -47,7 +58,7 @@ export async function setBlocked(e:Env,job:Job,userId:string,blocked:boolean,opt
  // Hints are detached when called from a coordinator; committed work survives
  // either wake failing and is also discovered by normal recovery scheduling.
  if(event) {
-  const wakes=Promise.allSettled([wakeLogs(e),...(blocked&&event.changed?[wakeWork(e,noticeLane(userId))]:[])]);
+  const wakes=Promise.allSettled([wakeLogs(e),...(event.changed||options.source==='manual'?[wakeWork(e,`card:${userId}`)]:[]),...(blocked&&event.changed?[wakeWork(e,noticeLane(userId))]:[])]);
   if(waitUntil)waitUntil(wakes);else await wakes;
  }
  return {applied:!!event?.committed,changed:!!event?.changed,eventId:event?.id??null};
@@ -66,16 +77,28 @@ export async function handleBanNotice(e:Env,job:Job,waitUntil?:(promise:Promise<
  u=(await user(e,event.user_id))!;
  if(!u.thread_id||!u.card_id)throw new RetryLater(now()+5000);
  await scheduleCard(e,job,u,false,waitUntil);
- const text=event.source==='rule'
-  ?`🚫 该用户因命中拦截规则已被自动封禁。\n触发规则：#${event.rule_id} · ${event.rule_kind==='regex'?'正则表达式':'关键词'}\n规则内容：${event.rule_pattern??''}`
-  :'🚫 该用户已被封禁。';
+ const timezone=await setting(e,'timezone','Asia/Singapore');
+ const occurred=new Intl.DateTimeFormat('sv-SE',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(event.created_at);
+ const source=event.source==='rule'
+  ?`操作来源：拦截规则自动封禁\n触发规则：#${event.rule_id} · ${event.rule_kind==='regex'?'正则表达式':'关键词'}\n规则内容：${event.rule_pattern??''}`
+  :'操作来源：管理员手动封禁';
+ // The immutable send records an acknowledged historical transition. A
+ // realtime status would already be stale if a later unblock commits while
+ // this request waits for Telegram; keep the current state on the pinned card.
+ const text=`🚫 封禁操作记录 #${event.id}\n发生时间：${occurred} (${timezone})\n${source}\n操作结果：该次封禁已确认生效。\n这是历史操作记录，不代表当前状态；当前状态请查看置顶资料卡。`;
  const result=await call<{message_id:number}>(e,`ban-notice:${event.id}`,'sendMessage',{
   chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,
-  text:text+(u.blocked?'':'\n当前状态：已解除封禁。'),disable_notification:true
+  text,disable_notification:true,reply_markup:{inline_keyboard:[[{text:'查看当前资料卡',url:topicLink(e,u.thread_id,u.card_id)}]]}
  },{threadVersion:{userId:u.tgid,version:u.binding_version,threadId:u.thread_id}});
  const valid=result.status==='success'&&Number.isSafeInteger(result.result?.message_id)&&result.result.message_id>0;
  const status=valid?'success':result.status==='success'?'unknown':result.status;
  const messageId=valid?(result as {status:'success';result:{message_id:number}}).result.message_id:null;
- const changed=await stmt(e,"UPDATE ban_events SET notice_status=?,notice_message_id=?,notice_thread_id=?,notice_binding_version=? WHERE id=? AND notice_status='pending'",status,messageId,u.thread_id,u.binding_version,event.id).run();
- if(changed.meta.changes&&status!=='success')await audit(e,'ban_notice_unavailable',{event:event.id,user:u.tgid,status,...(result.status!=='success'&&result.code?{code:result.code}:{})},waitUntil);
+ const [changed]=await e.DB.batch([
+  stmt(e,"UPDATE ban_events SET notice_status=?,notice_message_id=?,notice_thread_id=?,notice_binding_version=? WHERE id=? AND notice_status='pending'",status,messageId,u.thread_id,u.binding_version,event.id),
+  ...(status!=='success'?cardRepairStatements(e,u.tgid,event.event_key,now(),true):[])
+ ]);
+ if(changed.meta.changes&&status!=='success') {
+  const wake=wakeWork(e,`card:${u.tgid}`);if(waitUntil)waitUntil(wake);else await wake;
+  await audit(e,'ban_notice_unavailable',{event:event.id,user:u.tgid,status,...(result.status!=='success'&&result.code?{code:result.code}:{})},waitUntil);
+ }
 }

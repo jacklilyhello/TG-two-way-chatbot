@@ -222,14 +222,17 @@ describe('goal regression: current policy at the final external request boundary
   const values=new Map<string,unknown>(),pending:Promise<unknown>[]=[];
   const state={storage:{get:async(key:string)=>values.get(key),put:async(key:string,value:unknown)=>{values.set(key,value);},setAlarm:async()=>{}},waitUntil:(promise:Promise<unknown>)=>{pending.push(promise);}} as unknown as DurableObjectState;
   const coordinator=new ConversationCoordinator(state,e);let completed=false;
-  const processing=coordinator.fetch(new Request('https://conversation/wake',{method:'POST',body:JSON.stringify({key:'20001'})})).then(()=>{completed=true;});
+  const processing=(async()=>{
+   await coordinator.fetch(new Request('https://conversation/wake',{method:'POST',body:JSON.stringify({key:'moderation:20001'})}));
+   await coordinator.fetch(new Request('https://conversation/wake',{method:'POST',body:JSON.stringify({key:'20001'})}));
+  })().then(()=>{completed=true;});
   try {
    await vi.waitFor(()=>expect(completed).toBe(true));
    expect(methods).toEqual(['answerCallbackQuery','copyMessage']);
    expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:1});
    expect(await one(e,"SELECT event FROM audit_logs WHERE event='user_blocked'")).toEqual({event:'user_blocked'});
    expect(await one(e,"SELECT used FROM callback_actions WHERE token=?",action.token)).toEqual({used:202});
-   expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE user_key='20001' AND state='done'")).toEqual({n:2});
+   expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE user_key IN ('20001','moderation:20001') AND state='done'")).toEqual({n:2});
   } finally {release();await processing;await Promise.all(pending);}
  });
 });

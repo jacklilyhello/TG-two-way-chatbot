@@ -4,6 +4,7 @@ import {dueReceiptCleanup,receiptGuardValid} from './receipts';
 import {deliveryRetryGuardValid} from './delivery-retry';
 const allowed = new Set(['getMe','getChat','getChatMember','getUserProfilePhotos','createForumTopic','editForumTopic','sendMessage','sendPhoto','sendMediaGroup','copyMessage','editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','pinChatMessage','unpinChatMessage','setMessageReaction','deleteMessage','answerCallbackQuery','setMyCommands']);
 const nonSending = new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','deleteMessage','unpinChatMessage']);
+const priorityEdits=new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup']);
 const localRateDueHeader='X-Bot-Local-Rate-Due';
 const maxLocalWaitMs=1000;
 interface RequestBody {key:string;method:string;params:Params;guard?:IssueGuard}
@@ -11,18 +12,35 @@ interface Journal {phase:'issued'|'done';outcome?:Outcome;apiMs?:number}
 /** Bot-wide serialization, durable result journal and conservative shared-chat limits. */
 export class BotCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
+ private callbackTail:Promise<unknown>=Promise.resolve();
+ private cardControlTail:Promise<unknown>=Promise.resolve();
+ private controlRequests=new Map<string,Promise<unknown>>();
+ private reservationTail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
  async fetch(request:Request):Promise<Response> {
+  const journal=new URL(request.url).pathname==='/journal';
+  const body=journal?null:await request.clone().json<RequestBody>();
+  const callback=body?.method==='answerCallbackQuery';
+  const cardControl=body?.guard?.priority==='moderation-card'&&priorityEdits.has(body.method)&&Number.isSafeInteger(body.guard.threadVersion?.moderationVersion);
   let queuedMs=0,localWaitMs=0,scheduledMs=0,waits=0;
   for(;;) {
    const queuedAt=Date.now();
-   const result=this.tail.then(async()=>{
+   // Callback acknowledgements do not send a chat message. Their own durable
+   // lane can return an already-committed result while a business API request
+   // is still waiting for Telegram, without relaxing send/mutation pacing.
+   const result=(callback?this.callbackTail:cardControl?this.cardControlTail:this.tail).then(async()=>{
     queuedMs+=Math.max(0,Date.now()-queuedAt);
     const attempt=request.clone();
-    return new URL(attempt.url).pathname==='/journal'?this.journal(attempt):this.execute(attempt);
+    return journal?this.journal(attempt):this.execute(attempt);
    });
-   this.tail=result.catch(()=>{});
-   const response=await result;
+   if(callback||cardControl){
+    if(callback)this.callbackTail=result.catch(()=>{});else this.cardControlTail=result.catch(()=>{});
+    this.controlRequests.set(body!.key,result);
+   }
+   else this.tail=result.catch(()=>{});
+   let response:Response;
+   try {response=await result;}
+   finally {if((callback||cardControl)&&this.controlRequests.get(body!.key)===result)this.controlRequests.delete(body!.key);}
    const localDue=response.headers.get(localRateDueHeader);
    response.headers.delete(localRateDueHeader);
    const delay=localDue===null?NaN:Math.max(0,Number(localDue)-Date.now());
@@ -44,6 +62,9 @@ export class BotCoordinator {
  private async journal(request:Request):Promise<Response> {
   const {key}=await request.json<{key?:unknown}>();
   if(typeof key!=='string'||!key||key.length>4096)return new Response('invalid',{status:400});
+  // A paused reconciliation must wait for any active acknowledgement before
+  // deciding whether its durable result is actually unknown.
+  await this.controlRequests.get(key)?.catch(()=>{});
   const journalKey=`op:${key}`;
   const old=await this.state.storage.get<Journal>(journalKey);
   if(old?.phase==='done'&&old.outcome)return this.result(old.outcome,old.apiMs);
@@ -63,6 +84,10 @@ export class BotCoordinator {
    const outcome:Outcome={status:'unknown',reason:'发生未知情况：请求已发出，无法确认结果'};
    await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
   }
+  // Callback network requests may overlap ordinary Telegram requests. Keep
+  // their short final rate/guard/reservation section atomic with any newly
+  // received platform backoff; release it before awaiting Telegram itself.
+  const reserved=await this.withReservation(async()=>{
   const chat=String(params.chat_id??'');
   const exempt=method.startsWith('get')||method==='answerCallbackQuery';
   // Edits, deletes and unpins do not send a new message. Keep one conservative
@@ -77,7 +102,7 @@ export class BotCoordinator {
   if(rateCheckedAt<due) return Response.json({due},{status:429,headers:!exempt&&backoffAt<=rateCheckedAt&&due-rateCheckedAt<=maxLocalWaitMs?{[localRateDueHeader]:String(due)}:{}});
   const checks:D1PreparedStatement[]=[];
   const hiddenIndex=guard?.messageIds?.length?checks.push(this.env.DB.prepare(`SELECT id FROM messages WHERE id IN (${guard.messageIds.map(()=>'?').join(',')}) AND tombstone=1 LIMIT 1`).bind(...guard.messageIds))-1:-1;
-  const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id,blocked FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
+  const bindingIndex=guard?.threadVersion?checks.push(this.env.DB.prepare('SELECT binding_version,thread_id,blocked,moderation_version FROM users WHERE tgid=?').bind(guard.threadVersion.userId))-1:-1;
   const policyIndex=guard?.unblockedUser?(guard.unblockedUser===guard.threadVersion?.userId?bindingIndex:checks.push(this.env.DB.prepare('SELECT blocked FROM users WHERE tgid=?').bind(guard.unblockedUser))-1):-1;
   // Complex guards perform additional reads. Keep pause after those reads so
   // it remains the final safety check, while ordinary sends use one D1 batch.
@@ -86,9 +111,9 @@ export class BotCoordinator {
   const checked=checks.length?await this.env.DB.batch(checks):[];
   if(guard) {
    const hidden=hiddenIndex>=0&&checked[hiddenIndex].results.length>0;
-   const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number;blocked:number}|undefined:undefined;
+   const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number;blocked:number;moderation_version:number}|undefined:undefined;
    const policy=policyIndex>=0?checked[policyIndex].results[0] as {blocked:number}|undefined:undefined;
-   if(hidden||(guard.unblockedUser&&policy?.blocked!==0)||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
+   if(hidden||(guard.unblockedUser&&policy?.blocked!==0)||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)||(guard.threadVersion.moderationVersion!==undefined&&binding?.moderation_version!==guard.threadVersion.moderationVersion)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
     const outcome:Outcome={status:'failed',reason:'cancelled_by_state',code:409};
     await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
    }
@@ -99,6 +124,11 @@ export class BotCoordinator {
   const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;
   const reservation=(at:number)=>exempt?{}:{'rate:global':at+40*messageCount,...(chat?{[chatRateKey]:at+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})};
   await this.state.storage.put({[journalKey]:{phase:'issued'},...reservation(Date.now())});
+  return {reservation};
+  });
+  if(reserved instanceof Response)return reserved;
+  const {reservation}=reserved;
+  const reaction=method==='setMessageReaction';
   let outcome:Outcome;
   const apiStartedAt=Date.now();
   try {
@@ -109,8 +139,8 @@ export class BotCoordinator {
     const retry=Number(body.parameters?.retry_after);
     const retryAt=Date.now()+Math.max(1000,Number.isFinite(retry)?retry*1000:60000);
     await this.state.storage.delete(journalKey);
-    await this.state.storage.put({...reservation(apiStartedAt),'rate:backoff':Math.max(backoffAt,retryAt),'rate:global':Math.max(globalAt,exempt?0:apiStartedAt+40*messageCount,retryAt)});
-    return this.result({due:retryAt},Date.now()-apiStartedAt,429);
+    const due=await this.raiseBackoff(retryAt,reservation(apiStartedAt));
+    return this.result({due},Date.now()-apiStartedAt,429);
    } else if(body.ok===false&&typeof body.error_code==='number'&&body.error_code>=400&&body.error_code<500) {
     const reason=(body.description??'Telegram 拒绝请求').replaceAll(this.env.TELEGRAM_BOT_TOKEN,'[redacted]').replaceAll(this.env.TELEGRAM_WEBHOOK_SECRET,'[redacted]').slice(0,240);
     // Telegram's no-change response confirms the desired edit already exists.
@@ -122,8 +152,29 @@ export class BotCoordinator {
   if(method.startsWith('get')&&outcome.status==='unknown'){await this.state.storage.delete(journalKey);return this.result({due:Date.now()+5000},apiMs,429);}
   // A slow durable reservation can finish after its first deadline. Persist
   // the actual API-start anchor with the result before the next request runs.
-  await this.state.storage.put({[journalKey]:{phase:'done',outcome,apiMs},...reservation(apiStartedAt)});
+  await this.withReservation(async()=>{
+   const rates=await this.mergeRates(reservation(apiStartedAt));
+   await this.state.storage.put({[journalKey]:{phase:'done',outcome,apiMs},...rates});
+  });
   return this.result(outcome,apiMs);
+ }
+ private withReservation<T>(work:()=>Promise<T>):Promise<T> {
+  const result=this.reservationTail.then(work);
+  this.reservationTail=result.catch(()=>{});return result;
+ }
+ private raiseBackoff(due:number,reservation:Record<string,number>):Promise<number> {
+  return this.withReservation(async()=>{
+   const rates=await this.mergeRates(reservation);
+   const effective=Math.max(due,await this.state.storage.get<number>('rate:backoff')??0);
+   const global=Math.max(effective,await this.state.storage.get<number>('rate:global')??0,rates['rate:global']??0);
+   await this.state.storage.put({...rates,'rate:backoff':effective,'rate:global':global});
+   return effective;
+  });
+ }
+ private async mergeRates(reservation:Record<string,number>):Promise<Record<string,number>> {
+  const merged:Record<string,number>={};
+  for(const [key,due]of Object.entries(reservation))merged[key]=Math.max(due,await this.state.storage.get<number>(key)??0);
+  return merged;
  }
  private result(value:unknown,apiMs?:number,status=200):Response {
   return Response.json(value,{status,headers:apiMs===undefined?{}:{'X-Bot-Api-Ms':String(apiMs)}});
