@@ -1,7 +1,9 @@
 import type {Env, Job, MessageRow, Params, TGMessage, TGUpdate, UserRow} from './types';
 import {all, audit, enqueue, now, one, run, setting, stmt, user, wakeWork} from './db';
 import {call, notify, RetryLater, type IssueGuard, type Outcome} from './operations';
-import {ensureThread, ensureUser, scheduleCard} from './admin';
+import {ensureThread, ensureUser, scheduleCard, ensureInitialCardReady} from './admin';
+import {matchBlockRules} from './block-rules';
+import {setBlocked} from './moderation';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {syncReceipt} from './receipts';
 import {internalForward, admittedBindingMatches, albumMemberBindingMatches,privateAdmissionMatches} from './security';
@@ -19,6 +21,19 @@ const sourceVersion = (job: Job) => {
   return payload.update?.update_id ?? payload.update_id ?? job.id;
 };
 
+/** A pre-upgrade job may already have crossed Telegram's side-effect boundary
+ * without recording its message mapping. A newly added rule must not replace
+ * that recovery with a blocked row and discard the confirmed/unknown result. */
+async function moderationDeliveryStarted(e:Env,row:MessageRow,job:Job,edited=false):Promise<boolean> {
+ const keys=edited?[`edit:${row.id}:${sourceVersion(job)}`]:[`send:${row.id}`,`send:${row.id}:without-reply`,`fixed:${row.id}`];
+ return !!await one(e,`SELECT op_key FROM operations WHERE op_key IN (${keys.map(()=>'?').join(',')}) AND phase IN ('issued','success','unknown') LIMIT 1`,...keys.map(key=>`${e.RECOVERY_EPOCH}:${key}`));
+}
+async function sealModerationDecision(e:Env,job:Job,members?:number[]) {
+ await run(e,members
+  ?"UPDATE jobs SET payload=json_set(payload,'$.moderationChecked',json('true'),'$.moderationAlbumChecked',json(?)) WHERE id=?"
+  :"UPDATE jobs SET payload=json_set(payload,'$.moderationChecked',json('true')) WHERE id=?",...(members?[JSON.stringify(members),job.id]:[job.id]));
+}
+
 function media(m: TGMessage): Params | null {
   const file = m.photo?.at(-1)?.file_id;
   const entry = file ? ['photo', file] : m.video ? ['video', m.video.file_id] : m.audio ? ['audio', m.audio.file_id] : m.document ? ['document', m.document.file_id] : m.animation ? ['animation', m.animation.file_id] : null;
@@ -35,6 +50,39 @@ function knownMessageId(result: unknown): number | null {
 async function recordOutcome(e: Env, row: MessageRow, outcome: Outcome, thread: number | null, id: number | null = null) {
   const status = outcome.status === 'success' && id === null ? 'unknown' : outcome.status === 'failed' && outcome.code === 409 && outcome.reason === 'cancelled_by_state' ? 'suppressed' : outcome.status;
   await run(e, 'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),private_id=COALESCE(?,private_id),thread_id=? WHERE id=?', status, row.direction === 'in' ? id : null, row.direction === 'out' ? id : null, thread, row.id);
+}
+
+/** A ban stops new content, but cannot erase a send that already crossed the
+ * external side-effect boundary. Recover only its existing journal using an
+ * impossible binding guard and no content params: even a simultaneous unblock
+ * must never turn this reconciliation into a fresh Telegram send. */
+async function reconcileBlockedInbound(e:Env,row:MessageRow,waitUntil?:WaitUntil):Promise<boolean> {
+  if(row.direction!=='in'||row.epoch!==e.RECOVERY_EPOCH)return false;
+  const delivery=await latestDelivery(e,row);
+  const ledger=await one(e,"SELECT op_key FROM operations WHERE op_key=? AND phase IN ('issued','success','unknown')",`${e.RECOVERY_EPOCH}:${delivery.key}`);
+  if(!ledger)return false;
+  const ids=delivery.members??[row.id];
+  let outcome=await call(e,delivery.key,delivery.method,{}, {messageIds:ids,threadVersion:{userId:row.user_id,version:-1}});
+  if(delivery.members) {
+    const batch=await one<{thread_id:number|null;members:string}>(e,'SELECT thread_id,members FROM media_batches WHERE batch_key=?',delivery.key);
+    if(!batch)return false;
+    const members=await all<MessageRow>(e,"SELECT * FROM messages WHERE id IN (SELECT value FROM json_each(?)) AND user_id=? AND direction='in' AND epoch=? ORDER BY source_id",batch.members,row.user_id,e.RECOVERY_EPOCH);
+    const mapping=outcome.status==='success'&&Array.isArray(outcome.result)?outcome.result.map(knownMessageId):[];
+    if(outcome.status==='success'&&(members.length!==delivery.members.length||mapping.length!==members.length||mapping.some(id=>id===null)))outcome={status:'unknown',reason:'相册恢复结果无法完整对应，禁止猜测映射或重发'};
+    const cancelled=outcome.status==='failed'&&outcome.reason==='cancelled_by_state';
+    await e.DB.batch([
+      ...members.map((member,index)=>stmt(e,'UPDATE messages SET delivery=?,admin_id=COALESCE(?,admin_id),thread_id=? WHERE id=?',cancelled?'blocked':outcome.status,outcome.status==='success'?mapping[index]:null,batch.thread_id,member.id)),
+      stmt(e,"UPDATE media_batches SET state='done' WHERE batch_key=?",delivery.key)
+    ]);
+    for(const member of members)await deliveryNotice(e,{...member,thread_id:batch.thread_id},outcome,waitUntil);
+  } else {
+    const id=outcome.status==='success'?knownMessageId(outcome.result):null;
+    if(outcome.status==='success'&&id===null)outcome={status:'unknown',reason:'Telegram 恢复结果缺少有效消息 ID'};
+    if(outcome.status==='failed'&&outcome.reason==='cancelled_by_state')await run(e,"UPDATE messages SET delivery='blocked' WHERE id=?",row.id);
+    else await recordOutcome(e,row,outcome,row.thread_id,id);
+    await deliveryNotice(e,row,outcome,waitUntil);
+  }
+  return true;
 }
 
 async function deliveryNotice(e: Env, row: MessageRow, outcome: Outcome, waitUntil?: WaitUntil) {
@@ -186,6 +234,27 @@ async function album(e: Env, job: Job, row: MessageRow, m: TGMessage, u: UserRow
     await albumStatus(e, row, false, `album:${key}`, waitUntil);
     return;
   }
+  // Check every collected caption before issuing any part of an incoming album.
+  // Captions on later members must not let earlier uncaptioned photos through.
+  if(row.direction==='in') {
+    const sealed=await one<{members:string|null}>(e,"SELECT json_extract(payload,'$.moderationAlbumChecked') members FROM jobs WHERE id=?",job.id);
+    const decided=new Set<number>(sealed?.members?JSON.parse(sealed.members) as number[]:[]);
+    // A frozen batch retains the policy decision made before its first send.
+    // Legacy individual-copy fallbacks may instead prove that boundary through
+    // their ledger. Recover those results before considering later rule edits.
+    const started=!!savedBatch||(await Promise.all(members.map(member=>moderationDeliveryStarted(e,member,job)))).some(Boolean);
+    if(!started)for(const member of members) {
+      if(decided.has(member.id))continue;
+      const rule=await matchBlockRules(e,JSON.parse(member.payload) as TGMessage);
+      if(rule) {
+        await setBlocked(e,job,u.tgid,true,{source:'rule',rule,messageId:member.id},waitUntil);
+        const blocked=await user(e,u.tgid);
+        if(blocked)await scheduleCard(e,job,blocked,false,waitUntil);
+        return;
+      }
+    }
+    await sealModerationDecision(e,job,members.map(member=>member.id));
+  }
   const mediaItems = members.map(r => media(JSON.parse(r.payload) as TGMessage));
   const types = mediaItems.map(x => x?.type);
   const compatible = mediaItems.every(x => x !== null) && (types.every(t => t === 'photo' || t === 'video') || types.every(t => t === 'audio') || types.every(t => t === 'document'));
@@ -281,12 +350,36 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     return;
   }
   if (privateChat && u.blocked) {
-    if (row && !edited && row.delivery === 'pending') await run(e, "UPDATE messages SET delivery='blocked' WHERE id=?", row.id);
+    if(row&&!edited&&!await reconcileBlockedInbound(e,row,waitUntil)&&row.delivery==='pending')await run(e,"UPDATE messages SET delivery='blocked' WHERE id=?",row.id);
     return;
   }
   if(privateChat&&!await privateAdmissionMatches(e,job,u)) {
     if(row&&!edited&&row.delivery==='pending')await run(e,"UPDATE messages SET delivery='suppressed' WHERE id=?",row.id);
     return;
+  }
+  if(privateChat) {
+    // A quick ban/unblock cannot revive blocked backlog. Earlier issued sends
+    // still need their mappings recovered, without permission to issue anew.
+    if(row&&!edited&&row.delivery==='blocked'){await reconcileBlockedInbound(e,row,waitUntil);return;}
+    // The durable marker outlives rule edits and unblocking while this job retries.
+    if(await one(e,"SELECT id FROM jobs WHERE id=? AND json_extract(payload,'$.moderationBlocked')=1",job.id))return;
+    // Albums make one decision across all collected captions immediately before
+    // freezing their business batch. Edited captions remain separate decisions.
+    if(edited||!m.media_group_id) {
+      const checked=await one(e,"SELECT id FROM jobs WHERE id=? AND json_extract(payload,'$.moderationChecked')=1",job.id);
+      const delivered=!!row&&(!edited&&row.delivery!=='pending'||await moderationDeliveryStarted(e,row,job,edited));
+      if(!checked&&!delivered) {
+        const rule=await matchBlockRules(e,m);
+        if(rule) {
+          await setBlocked(e,job,u.tgid,true,{source:'rule',rule,...(row?{messageId:row.id}:{})},waitUntil);
+          u=(await user(e,u.tgid))!;
+          // The independent notice lane creates a missing conversation and its card.
+          if(u.thread_id)await scheduleCard(e,job,u,false,waitUntil);
+          return;
+        }
+      }
+      await sealModerationDecision(e,job);
+    }
   }
   if (edited) {await edit(e, job, row, m, u,waitUntil); return;}
   if (!row || row.tombstone || row.deletion !== 'none') return;
@@ -308,6 +401,7 @@ export async function handleMessage(e: Env, job: Job, m: TGMessage, edited: bool
     // rejects a later binding change before any new external side effect.
     if (!u.thread_id) u = await ensureThread(e, job, u.tgid, false,waitUntil);
     if (!u.thread_id) {await audit(e, 'forward_missing_thread', {message: row.id},waitUntil); return;}
+    if(!await ensureInitialCardReady(e,job,u))throw new RetryLater(now()+1000);
     await scheduleCard(e, job, u, false, waitUntil);
   }
   if (m.media_group_id) {

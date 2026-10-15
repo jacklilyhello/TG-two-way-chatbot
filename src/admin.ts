@@ -5,6 +5,8 @@ import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {admittedBindingMatches,internalForward} from './security';
 import {reserveDeliveryRetry} from './delivery-retry';
+import {rulesPanel,handleRuleCommand,handleRuleAction} from './block-rules';
+import {setBlocked} from './moderation';
 
 interface Action {
  token: string; kind: string; user_id: string; actor_id: string; thread_id: number | null;
@@ -45,15 +47,20 @@ export async function ensureUser(e: Env, id: string, profile?: TGUser, contactAt
 }
 
 async function createAction(e: Env, kind: string, u: UserRow | null, actor: string, thread: number | null, payload: Params = {}, expires = now()+15*60_000, context?: string) {
- if (context) {
-  const existing = await one<{token:string}>(e,'SELECT token FROM callback_actions WHERE kind=? AND user_id=? AND actor_id=? AND thread_id IS ? AND version=? AND json_extract(payload,\'$.context\')=?',kind,u?.tgid ?? '',actor,thread,u?.binding_version ?? 0,context);
-  if (existing) return existing.token;
- }
  const token = crypto.randomUUID().replace(/-/g,'');
+ if (context) {
+  const where="kind=? AND user_id=? AND actor_id=? AND thread_id IS ? AND version=? AND json_extract(payload,'$.context')=? AND used=0";
+  const identity=[kind,u?.tgid ?? '',actor,thread,u?.binding_version ?? 0,context];
+  const [,selected]=await e.DB.batch<{token:string}>([
+   stmt(e,`INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM callback_actions WHERE ${where})`,token,kind,u?.tgid ?? '',actor,thread,u?.binding_version ?? 0,JSON.stringify({...payload,instance:e.INSTANCE_ID,context}),expires,...identity),
+   stmt(e,`SELECT token FROM callback_actions WHERE ${where}`, ...identity)
+  ]);
+  return selected.results[0].token;
+ }
  await run(e,'INSERT INTO callback_actions(token,kind,user_id,actor_id,thread_id,version,payload,expires_at) VALUES(?,?,?,?,?,?,?,?)',token,kind,u?.tgid ?? '',actor,thread,u?.binding_version ?? 0,JSON.stringify({...payload,instance:e.INSTANCE_ID,...(context ? {context} : {})}),expires);
  return token;
 }
-async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: Action, stamp?: number,waitUntil?:(promise:Promise<unknown>)=>void) {
+async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: Action, stamp?: number,waitUntil?:(promise:Promise<unknown>)=>void,initialCard=false) {
  const logThread = Number(await setting(e,'log_thread_id','0'));
  if (thread <= 1 || thread === logThread) return false;
  const queries: D1PreparedStatement[] = [];
@@ -61,6 +68,7 @@ async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: 
  const gate = action ? ' AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=?)' : '';
  queries.push(stmt(e,`UPDATE users SET thread_id=?,binding_version=binding_version+1,card_id=NULL WHERE tgid=? AND binding_version=? AND thread_id IS ? AND NOT EXISTS(SELECT 1 FROM users WHERE thread_id=? AND tgid!=?) AND ?!=COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key='log_thread_id'),0)${gate}`,thread,u.tgid,u.binding_version,u.thread_id,thread,u.tgid,thread,...(action ? [action.token,stamp] : [])));
  queries.push(stmt(e,'INSERT INTO thread_history(user_id,thread_id,version,created_at) SELECT tgid,thread_id,binding_version,? FROM users WHERE tgid=? AND thread_id=? AND binding_version=? AND NOT EXISTS(SELECT 1 FROM thread_history WHERE user_id=? AND version=?)',now(),u.tgid,thread,u.binding_version+1,u.tgid,u.binding_version+1));
+ if(initialCard)queries.push(stmt(e,"INSERT OR IGNORE INTO settings(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM users WHERE tgid=? AND thread_id=? AND binding_version=?)",`card_initial:${u.tgid}:${u.binding_version+1}`,`pending:${thread}`,u.tgid,thread,u.binding_version+1));
  await e.DB.batch(queries);
  const current = await user(e,u.tgid);
  const success = current?.thread_id === thread && current.binding_version === u.binding_version+1;
@@ -70,7 +78,8 @@ async function bind(e: Env, u: UserRow, thread: number, actor: string, action?: 
 async function retryKnownCreationFailures(e: Env, job: Job, u: UserRow) {
  const candidates = [
   {setting:`thread_create_key:${u.tgid}`,base:`thread:create:${u.tgid}`,needed:!u.thread_id},
-  {setting:`card_create_key:${u.tgid}:${u.binding_version}`,base:`card:${u.tgid}:${u.binding_version}:create`,needed:!!u.thread_id&&!u.card_id}
+  {setting:`card_create_key:${u.tgid}:${u.binding_version}`,base:`card:${u.tgid}:${u.binding_version}:create`,needed:!!u.thread_id&&!u.card_id},
+  {setting:`card_initial_pin_key:${u.tgid}:${u.binding_version}`,base:`card:${u.tgid}:${u.binding_version}:initial:pin:${u.card_id}`,needed:!!u.card_id&&(await setting(e,`card_initial:${u.tgid}:${u.binding_version}`)).startsWith('pending:')}
  ];
  for (const candidate of candidates) {
   if (!candidate.needed) continue;
@@ -84,7 +93,10 @@ async function retryKnownCreationFailures(e: Env, job: Job, u: UserRow) {
 
 export async function ensureThread(e: Env, job: Job, userId: string, prepareCard = true,waitUntil?:(promise:Promise<unknown>)=>void): Promise<UserRow> {
  let u = await ensureUser(e,userId,undefined,job.created_at);
- if (u.thread_id) return u;
+ if (u.thread_id) {
+  if(prepareCard)await ensureInitialCardReady(e,job,u);
+  return (await user(e,userId))!;
+ }
  const profile = await call<TGUser>(e,`job:${job.id}:profile:${userId}`,'getChat',{chat_id:userId});
  if (profile.status === 'success') u = await ensureUser(e,userId,profile.result,job.created_at);
  // A stable key is essential: a lost createForumTopic response must never
@@ -95,16 +107,19 @@ export async function ensureThread(e: Env, job: Job, userId: string, prepareCard
   await audit(e,'thread_create_unavailable',{user:userId,status:result.status},waitUntil);
   return u;
  }
- if (!await bind(e,u,result.result.message_thread_id,'system',undefined,undefined,waitUntil)) {
+ if (!await bind(e,u,result.result.message_thread_id,'system',undefined,undefined,waitUntil,true)) {
   await audit(e,'thread_create_binding_conflict',{user:userId,thread:result.result.message_thread_id},waitUntil);
   return (await user(e,userId))!;
  }
- if(prepareCard)await refreshCard(e,job,userId,false,waitUntil);
+ if(prepareCard) {
+  await ensureInitialCardReady(e,job,userId);
+  await refreshCard(e,job,userId,false,waitUntil);
+ }
  return (await user(e,userId))!;
 }
 
-/** Card repair has its own durable lane. Business messages keep their receive
- * order and never wait for profile photos, card buttons or pinning. */
+/** Existing-card maintenance has its own durable lane. Newly created topics
+ * cross a persisted initial-card gate before any business delivery. */
 export async function scheduleCard(e:Env,job:Job,u:UserRow,force=false,waitUntil?:(promise:Promise<unknown>)=>void) {
  if(!u.thread_id)return;
  const key=`card:${u.tgid}`,time=now();
@@ -134,9 +149,12 @@ function cardText(u: UserRow, timezone: string) {
  const date = new Intl.DateTimeFormat('zh-CN',{timeZone:timezone,dateStyle:'medium',timeStyle:'short'}).format(new Date(u.first_contact));
  return `姓名：${escape(displayName(u))}\nTGID：<code>${u.tgid}</code>\n用户名：${u.username ? '@'+escape(u.username) : '未设置'}\n首次联系：${date} (${escape(timezone)})\n状态：${u.blocked ? '已封禁' : '正常'}\n资料入口受 Telegram 隐私设置与客户端支持限制。`;
 }
-const cardSignature = (u: UserRow, timezone: string) => JSON.stringify([u.card_id,u.first_name,u.last_name,u.username,u.first_contact,u.photo_id,u.blocked,timezone]);
-async function keyboard(e: Env, job: Job, u: UserRow) {
- const context = `card:${job.id}`;
+// The moderation generation distinguishes normal -> blocked -> normal cycles.
+// A retried render must not recover a keyboard whose actions were consumed in
+// an earlier occurrence of the same visible state.
+const cardSignature = (u: UserRow, timezone: string) => JSON.stringify([u.card_id,u.first_name,u.last_name,u.username,u.first_contact,u.photo_id,u.blocked,u.moderation_version ?? 0,timezone]);
+const cardDigest = async(value:string)=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))).map(byte=>byte.toString(16).padStart(2,'0')).join('');
+async function keyboard(e: Env, job: Job, u: UserRow, context = `card:${job.id}`) {
  const block = await createAction(e,u.blocked ? 'card_unblock' : 'card_block',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
  const clear = await createAction(e,'card_clear',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
  const links = profileLinks(u);
@@ -163,11 +181,55 @@ async function cardCall(e:Env,key:string,method:string,params:Params,guard:Issue
 async function recordProblem(e: Env, event: string, u: UserRow, result: Outcome) {
  if (result.status !== 'success') await audit(e,event,{user:u.tgid,thread:u.thread_id,status:result.status,code:result.code ?? null});
 }
+/** A marker is created atomically with a new binding. The stable send/pin keys
+ * also coordinate a recovered business job with the independent card lane.
+ * Legacy bindings have no marker and do not pay this initialization cost. */
+export async function ensureInitialCardReady(e:Env,job:Job,target:string|UserRow):Promise<boolean> {
+ const userId=typeof target==='string'?target:target.tgid;
+ let u=typeof target==='string'?await user(e,target):target;
+ if(!u?.thread_id)return false;
+ const marker=`card_initial:${u.tgid}:${u.binding_version}`;
+ const initial=await setting(e,marker);
+ if(!initial)return true;
+ if(initial===`ready:${u.thread_id}:${u.card_id}`)return true;
+ const base=`card:${u.tgid}:${u.binding_version}`;
+ const guard:IssueGuard={threadVersion:{userId:u.tgid,version:u.binding_version,threadId:u.thread_id}};
+ const fail=async(stage:string,result:Outcome):Promise<never>=>{
+  const logged=await run(e,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',`${marker}:problem:${stage}`,result.status);
+  if(logged.meta.changes)await recordProblem(e,`initial_card_${stage}_unavailable`,u!,result);
+  // A terminal external result must keep business behind this gate. Ordinary
+  // coordinator error handling puts it in attention instead of retrying sends.
+  throw new Error('initial_card_not_confirmed');
+ };
+ let cardId=u.card_id;
+ if(!cardId) {
+  const timezone=await setting(e,'timezone','Asia/Singapore');
+  const controls=await keyboard(e,job,u,`${base}:initial`);
+  const creationKey=await setting(e,`card_create_key:${u.tgid}:${u.binding_version}`,`${base}:create`);
+  const result=await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text:cardText(u,timezone),parse_mode:'HTML',reply_markup:controls.markup},guard,u);
+  if(result.status!=='success')return fail('create',result);
+  if(!Number.isSafeInteger(result.result.message_id)||result.result.message_id<=0)return fail('create',{status:'unknown',reason:'Telegram 返回缺少有效资料卡消息 ID'});
+  cardId=result.result.message_id as number;
+  await e.DB.batch([
+   stmt(e,'UPDATE users SET card_id=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id IS NULL',cardId,u.tgid,u.binding_version,u.thread_id),
+   stmt(e,"INSERT OR IGNORE INTO settings(key,value) VALUES(?,'text')",`card_media:${u.tgid}:${u.binding_version}`)
+  ]);
+ }
+ const pinKey=await setting(e,`card_initial_pin_key:${u.tgid}:${u.binding_version}`,`${base}:initial:pin:${cardId}`);
+ const pin=await call(e,pinKey,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
+ if(pin.status!=='success')return fail('pin',pin);
+ await run(e,'UPDATE settings SET value=? WHERE key=? AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=?)',`ready:${u.thread_id}:${cardId}`,marker,u.tgid,u.binding_version,u.thread_id,cardId);
+ u=await user(e,userId);
+ return !!u&&await setting(e,marker)===`ready:${u.thread_id}:${u.card_id}`;
+}
 /** Only the card coordinator calls this in production. All administrator and
  * incoming-message paths enqueue work on that same lane. */
 export async function refreshCardNow(e: Env, job: Job, userId: string, force = false): Promise<void> {
  let u = await user(e,userId);
  if (!u?.thread_id) return;
+ if(!await ensureInitialCardReady(e,job,u))return;
+ u=await user(e,userId);
+ if(!u?.thread_id)return;
  const boundVersion=u.binding_version,boundThread=u.thread_id;
  const guard:IssueGuard={threadVersion:{userId:u.tgid,version:boundVersion,threadId:boundThread}};
  const photoChecked=Number(await setting(e,`profile_checked:${u.tgid}`,'0'));
@@ -187,16 +249,23 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  const stateKey = `card_state:${u.tgid}:${u.binding_version}`;
  if (!force && u.card_id && await setting(e,stateKey)===cardSignature(u,timezone)) return;
  const text = cardText(u,timezone);
+ const signatureDigest=await cardDigest(cardSignature(u,timezone));
  // Tokens are immutable and bind to the card and binding, so an old keyboard
  // cannot control a later card even if Telegram kept its message in history.
- const controls = await keyboard(e,job,u);
+ const controls = await keyboard(e,job,u,`card:${job.id}:${signatureDigest}`);
+ // The same profile can return after an intervening render retired its
+ // controls. Fresh tokens require a fresh edit journal even for identical text.
+ const render=await cardDigest(JSON.stringify([signatureDigest,controls.tokens]));
  let reply_markup = controls.markup;
  const mediaKey = `card_media:${u.tgid}:${u.binding_version}`;
  const existingMedia = await setting(e,mediaKey,'text');
  const base = `card:${u.tgid}:${u.binding_version}`;
  let cardId = u.card_id;
  let updated = true;
- const replace = cardId && ((existingMedia === 'text' && u.photo_id) || (existingMedia !== 'text' && !u.photo_id));
+ // New topics deliberately keep the original text card. Converting it to a
+ // photo would move the current pinned panel behind the first business item.
+ const initialText=existingMedia==='text'&&!!await setting(e,`card_initial:${u.tgid}:${u.binding_version}`);
+ const replace = cardId && ((!initialText&&existingMedia === 'text' && u.photo_id) || (existingMedia !== 'text' && !u.photo_id));
  if (!cardId || replace) {
   const creationKey = replace ? `${base}:replace:${cardId}:${u.photo_id ?? 'text'}` : await setting(e,`card_create_key:${u.tgid}:${u.binding_version}`,`${base}:create`);
   const result = u.photo_id
@@ -218,9 +287,9 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  } else {
   const result = existingMedia !== 'text'
    ? u.photo_id && u.photo_id !== existingMedia
-    ? await cardCall(e,`job:${job.id}:card:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup},guard,u)
-    : await cardCall(e,`job:${job.id}:card:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup},guard,u)
-   : await cardCall(e,`job:${job.id}:card:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup},guard,u);
+    ? await cardCall(e,`job:${job.id}:card:${render}:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup},guard,u)
+    : await cardCall(e,`job:${job.id}:card:${render}:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup},guard,u)
+   : await cardCall(e,`job:${job.id}:card:${render}:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup},guard,u);
   await recordProblem(e,'card_update_failed',u,result);
   updated = result.status==='success';
   if (result.status === 'success' && u.photo_id && existingMedia !== 'text') await setSetting(e,mediaKey,u.photo_id);
@@ -228,12 +297,17 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  // A recovered create may return an already-created card with another job's
  // keyboard. Establish this generation before retiring older controls.
  if(await setting(e,`card_no_id_links:${u.tgid}`)==='1')reply_markup=withoutPrivateLinks(reply_markup);
- const markup = await cardCall(e,`job:${job.id}:card:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup},guard,u);
+ const markup = await cardCall(e,`job:${job.id}:card:${render}:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup},guard,u);
  await recordProblem(e,'card_buttons_failed',u,markup);
  if (markup.status==='success') await run(e,"UPDATE callback_actions SET used=-1 WHERE user_id=? AND version=? AND kind LIKE 'card_%' AND used=0 AND token NOT IN (?,?)",u.tgid,u.binding_version,...controls.tokens);
- const pin = await call(e,`job:${job.id}:card:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
+ const pin = await call(e,`job:${job.id}:card:${render}:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
  await recordProblem(e,'card_pin_failed',u,pin);
- if (updated && markup.status==='success' && pin.status==='success') await setSetting(e,stateKey,cardSignature({...u,card_id:cardId},timezone));
+ if (updated && markup.status==='success' && pin.status==='success') {
+  const current=await user(e,userId);
+  if(!current||current.binding_version!==boundVersion||current.thread_id!==boundThread)return;
+  if(cardSignature(current,timezone)!==cardSignature({...u,card_id:cardId},timezone))throw new RetryLater(now()+100);
+  await setSetting(e,stateKey,cardSignature(current,timezone));
+ }
 }
 
 function partsAt(timestamp: number, timezone: string) {
@@ -293,7 +367,7 @@ async function panel(e: Env, job: Job, actor: string, range: Range) {
  const ranges: Range[] = ['today','7','30','all'];
  const buttons: Button[] = [];
  for (const r of ranges) buttons.push(await panelButton(e,job,{today:'今日','7':'7 天','30':'30 天',all:'全部'}[r],actor,{view:'stats',range:r}));
- await sendPanel(e,`job:${job.id}:panel:${range}`,text,[buttons,[await panelButton(e,job,'用户列表',actor,{view:'users',page:0}),await panelButton(e,job,'系统设置',actor,{view:'settings'})]]);
+ await sendPanel(e,`job:${job.id}:panel:${range}`,text,[buttons,[await panelButton(e,job,'用户列表',actor,{view:'users',page:0}),await panelButton(e,job,'系统设置',actor,{view:'settings'})],[await panelButton(e,job,'拦截规则',actor,{view:'rules'})]]);
 }
 async function usersPage(e: Env, job: Job, actor: string, page: number) {
  const total = (await one<{count:number}>(e,'SELECT COUNT(*) count FROM users'))!.count;
@@ -388,7 +462,12 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
   else if (payload.view==='users') await usersPage(e,job,String(cb.from.id),Number(payload.page)||0);
   else if (payload.view==='user' && validUserId(String(payload.id))) await userDetail(e,job,String(payload.id));
   else if (payload.view==='settings') await settingsPanel(e,job);
+  else if (payload.view==='rules') await rulesPanel(e,job,String(cb.from.id));
   await answer(e,job,cb.id,'已更新。');return;
+ }
+ if(a.kind.startsWith('rule_')) {
+  if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'规则管理仅限原 General 消息。');return;}
+  await answer(e,job,cb.id,await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil));return;
  }
  const u = await user(e,a.user_id);
  if (a.kind==='clear_confirm') {
@@ -415,22 +494,8 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  if (a.kind==='card_block' || a.kind==='card_unblock') {
   const blocked = a.kind==='card_block' ? 1 : 0;
   if (a.used===0) {
-   // Audit, state change and consumption commit together. A resumed callback
-   // only repairs its remaining UI operations, never reapplies the mutation.
-   const epochGate=logEpochStatements(e);
-   const mutations=await e.DB.batch([
-    ...epochGate,
-    stmt(e,'INSERT INTO audit_logs(event,detail,created_at) SELECT ?,?,? FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked!=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked ? 'user_blocked' : 'user_unblocked',JSON.stringify({user:u.tgid,actor:String(cb.from.id)}),now(),u.tgid,a.version,a.thread_id,m.message_id,blocked,a.token),
-    stmt(e,'UPDATE users SET blocked=? WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND EXISTS(SELECT 1 FROM callback_actions WHERE token=? AND used=0)',blocked,u.tgid,a.version,a.thread_id,m.message_id,a.token),
-    stmt(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0 AND EXISTS(SELECT 1 FROM users WHERE tgid=? AND binding_version=? AND thread_id=? AND card_id=? AND blocked=?)',stamp,a.token,u.tgid,a.version,a.thread_id,m.message_id,blocked),
-    ...logOutboxStatements(e)
-   ]);
-   if(mutations.slice(epochGate.length+3).some(result=>result.meta.changes>0)) {
-    const wake=wakeLogs(e);
-    if(waitUntil)waitUntil(wake);else await wake;
-   }
-   const applied = await one<{used:number}>(e,'SELECT used FROM callback_actions WHERE token=?',a.token);
-   if (applied?.used!==stamp) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
+   const result=await setBlocked(e,job,u.tgid,blocked===1,{source:'manual',actorId:String(cb.from.id),action:{token:a.token,stamp,version:a.version,threadId:a.thread_id!,cardId:m.message_id}},waitUntil);
+   if(!result.applied) {await answer(e,job,cb.id,'绑定或资料卡已变化，请使用当前资料卡。');return;}
   } else if (u.blocked!==blocked) {
    await answer(e,job,cb.id,'操作已处理，请使用当前资料卡。');return;
   }
@@ -529,6 +594,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
  const [view,...rest] = args.split(/\s+/);
  const value = rest.join(' ');
  if (!view || ['today','7','30','all'].includes(view)) await panel(e,job,String(m.from!.id),(view || 'today') as Range);
+ else if(view==='rules') await handleRuleCommand(e,job,String(m.from!.id),args.slice('rules'.length).trim(),waitUntil);
  else if (view==='users') await usersPage(e,job,String(m.from!.id),Math.max(0,Number(rest[0] ?? 1)-1));
  else if ((view==='search' || view==='user') && validUserId(value)) await userDetail(e,job,value);
  else if (view==='settings') await settingsPanel(e,job);

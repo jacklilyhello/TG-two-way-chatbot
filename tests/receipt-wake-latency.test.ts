@@ -149,7 +149,7 @@ describe('receipt wake hints after durable intent',()=>{
 });
 
 describe('first-contact delivery and asynchronous card ordering',()=>{
- it('confirms the first business message before a later card avatar query can hang and preserves first contact',async()=>{
+ it('pins the initial panel before the first business message and defers a hanging avatar query',async()=>{
   const e={...env} as unknown as Env;
   let clock=100000;
   vi.spyOn(Date,'now').mockImplementation(()=>clock);
@@ -169,8 +169,8 @@ describe('first-contact delivery and asynchronous card ordering',()=>{
   }})} as unknown as DurableObjectNamespace;
   const pending:Promise<unknown>[]=[],wake=conversation(e,pending);
   await wake();
-  expect(methods).toEqual(['getChat','createForumTopic','copyMessage']);
-  expect(await one(e,'SELECT first_contact,thread_id,binding_version,card_id FROM users WHERE tgid=\'20001\'')).toEqual({first_contact:100000,thread_id:40,binding_version:1,card_id:null});
+  expect(methods).toEqual(['getChat','createForumTopic','sendMessage','pinChatMessage','copyMessage']);
+  expect(await one(e,'SELECT first_contact,thread_id,binding_version,card_id FROM users WHERE tgid=\'20001\'')).toEqual({first_contact:100000,thread_id:40,binding_version:1,card_id:700});
   const card=(await one<Job>(e,"SELECT * FROM jobs WHERE kind='card'"))!;
   let cardDone=false;
   const cardProcessing=execute(e,card).then(()=>{cardDone=true;});
@@ -183,6 +183,7 @@ describe('first-contact delivery and asynchronous card ordering',()=>{
   await accept(e,update(22));await wake();await Promise.all(pending);
   expect(await one(e,"SELECT first_contact,thread_id FROM users WHERE tgid='20001'")).toEqual({first_contact:100000,thread_id:40});
   expect(methods.filter(method=>method==='createForumTopic')).toHaveLength(1);
+  expect(methods.filter(method=>method==='sendMessage')).toHaveLength(1);
   expect(methods.filter(method=>method==='copyMessage')).toHaveLength(2);
   expect(vi.mocked(fetch)).not.toHaveBeenCalled();
  });

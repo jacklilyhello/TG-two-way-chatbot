@@ -39,7 +39,7 @@ describe('administrator block mutation retry boundaries',()=>{
   await handleCard(e,card);
   await handleAdmin(e,job,callback);
   expect(await all(e,"SELECT event FROM audit_logs WHERE event IN ('user_blocked','user_unblocked')")).toEqual([{event}]);
-  expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${card.id}:card:pin:500`)).toEqual({phase:'success'});
+  expect(await one(e,"SELECT phase FROM operations WHERE op_key LIKE ?",`${e.RECOVERY_EPOCH}:job:${card.id}:card:%:pin:500`)).toEqual({phase:'success'});
   expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${id}:answer:synthetic-block-callback`)).toEqual({phase:'success'});
  });
  it('rolls back state, callback consumption and audit together when its D1 transaction fails',async()=>{
