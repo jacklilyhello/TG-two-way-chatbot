@@ -47,7 +47,7 @@ describe('administrator bindings and profile cards',()=>{
   const updated=await ensureUser(e,'20001',{id:20001,first_name:'New'});
   expect(updated.first_contact).toBe(initial.first_contact);
   expect(updated.username).toBeNull();
-  expect(profileLinks(updated)).toEqual(['tg://user?id=20001','tg://user?id=20001','tg://user?id=20001']);
+  expect(profileLinks(updated)).toEqual(['tg://user?id=20001','tg://user?id=20001','tg://openmessage?user_id=20001']);
   expect(profileLinks({tgid:'20001',username:'alice_test'})).toEqual(['https://t.me/alice_test?profile','tg://resolve?domain=alice_test&profile','tg://resolve?domain=alice_test&profile']);
   expect(validUserId('2000000000000')).toBe(true);
   expect(validUserId('4503599627370496')).toBe(false);
@@ -150,7 +150,7 @@ describe('administrator bindings and profile cards',()=>{
   expect((await user(e,'20001'))!.photo_id).toBe('new-avatar');
   expect(api.requests.find(r=>r.method==='sendPhoto')?.params.photo).toBe('new-avatar');
  });
- it('repairs only a confirmed privacy-rejected card using a stable link-free operation',async()=>{
+ it('repairs only a confirmed privacy-rejected card using a stable callback fallback operation',async()=>{
   await registered();await run(e,"UPDATE users SET card_id=NULL WHERE tgid='20001'");
   api.overrides.set('card:20001:1:create',{status:'failed',code:400,reason:'Bad Request: BUTTON_USER_PRIVACY_RESTRICTED'});
   await refreshCard(e,job(83),'20001');
@@ -158,6 +158,9 @@ describe('administrator bindings and profile cards',()=>{
   expect(sends.map(r=>r.key)).toEqual(['card:20001:1:create','card:20001:1:create:without-private-links']);
   expect(JSON.stringify(sends[0].params.reply_markup)).toContain('tg://user?id=');
   expect(JSON.stringify(sends[1].params.reply_markup)).not.toContain('tg://user?id=');
+  const profileButtons=(sends[1].params.reply_markup as {inline_keyboard:{text:string;callback_data?:string}[][]}).inline_keyboard[0];
+  expect(profileButtons.map(button=>button.text)).toEqual(['通用资料','苹果资料','安卓资料']);
+  expect(profileButtons.every(button=>button.callback_data?.startsWith('a:'))).toBe(true);
   expect(JSON.stringify(sends[1].params.reply_markup)).toContain('清空此对话');
   expect((await user(e,'20001'))!.card_id).toBeGreaterThan(0);
   expect(await one(e,"SELECT phase FROM operations WHERE op_key='initial:card:20001:1:create'")).toEqual({phase:'failed'});

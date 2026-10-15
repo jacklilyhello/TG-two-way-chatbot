@@ -201,7 +201,7 @@ describe('rule management actual administrator dispatcher',()=>{
  it('routes panel and rule callbacks onto a nonempty durable administrator lane',async()=>{
   const {e}=client();await rulesPanel(e,job(230),'10001');
   const action=(await one<RuleAction>(e,"SELECT * FROM callback_actions WHERE kind='rule_help'"))!;
-  expect(await accept(e,callback(e,231,action))).toBe('admin');
-  expect(await one(e,"SELECT user_key FROM jobs WHERE dedupe='u:231'")).toEqual({user_key:'admin'});
+  expect(await accept(e,callback(e,231,action))).toBe('admin:10001');
+  expect(await one(e,"SELECT user_key FROM jobs WHERE dedupe='u:231'")).toEqual({user_key:'admin:10001'});
  });
 });

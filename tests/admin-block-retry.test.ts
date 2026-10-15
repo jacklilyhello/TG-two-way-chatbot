@@ -24,7 +24,7 @@ async function setup(kind:string,initial:number,defer=false):Promise<Env> {
  return {...base,BOT:bot} as unknown as Env;
 }
 describe('administrator block mutation retry boundaries',()=>{
- it.each([['card_block',0,1,'user_blocked'],['card_unblock',1,0,'user_unblocked']])('audits %s once across two deferred UI repairs',async(kind,initial,desired,event)=>{
+ it.each([['card_block',0,1,'user_blocked'],['card_unblock',1,0,'user_unblocked']])('audits %s once across a deferred atomic card edit',async(kind,initial,desired,event)=>{
   const e=await setup(String(kind),Number(initial),true);
   await accept(e,callback);await accept(e,callback);
   expect(await one(e,'SELECT COUNT(*) n FROM inbox_updates WHERE update_id=?',id)).toEqual({n:1});
@@ -35,11 +35,11 @@ describe('administrator block mutation retry boundaries',()=>{
   await run(e,"UPDATE jobs SET state='done' WHERE dedupe=?",`u:${id}`);
   const card=(await one<Job>(e,"SELECT * FROM jobs WHERE kind='card'"))!;
   await expect(handleCard(e,card)).rejects.toBeInstanceOf(RetryLater);
-  await expect(handleCard(e,card)).rejects.toBeInstanceOf(RetryLater);
   await handleCard(e,card);
   await handleAdmin(e,job,callback);
   expect(await all(e,"SELECT event FROM audit_logs WHERE event IN ('user_blocked','user_unblocked')")).toEqual([{event}]);
-  expect(await one(e,"SELECT phase FROM operations WHERE op_key LIKE ?",`${e.RECOVERY_EPOCH}:job:${card.id}:card:%:pin:500`)).toEqual({phase:'success'});
+  expect(await one(e,"SELECT phase FROM operations WHERE op_key LIKE ?",`${e.RECOVERY_EPOCH}:job:${card.id}:card:%:text:500`)).toEqual({phase:'success'});
+  expect(await all(e,"SELECT method FROM operations WHERE method IN ('getUserProfilePhotos','pinChatMessage','editMessageReplyMarkup')")).toEqual([]);
   expect(await one(e,"SELECT phase FROM operations WHERE op_key=?",`${e.RECOVERY_EPOCH}:job:${id}:answer:synthetic-block-callback`)).toEqual({phase:'success'});
  });
  it('rolls back state, callback consumption and audit together when its D1 transaction fails',async()=>{

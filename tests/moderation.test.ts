@@ -36,7 +36,9 @@ describe('durable shared ban transitions and administrator notices',()=>{
   const notice=(await pendingNotice(e))!;await handleBanNotice(e,notice);await handleBanNotice(e,notice);
   expect(sent).toHaveLength(1);
   expect(sent[0].method).toBe('sendMessage');
-  expect(sent[0].params).toMatchObject({chat_id:e.ADMIN_CHAT_ID,message_thread_id:40,text:'🚫 该用户已被封禁。'});
+  expect(sent[0].params).toMatchObject({chat_id:e.ADMIN_CHAT_ID,message_thread_id:40});
+  expect(sent[0].params.text).toContain(`🚫 封禁操作记录 #${result.eventId}`);
+  expect(sent[0].params.text).toContain('操作来源：管理员手动封禁');
   expect(await one(e,'SELECT notice_status,notice_message_id FROM ban_events WHERE id=?',result.eventId)).toEqual({notice_status:'success',notice_message_id:701});
  });
  it('does not reapply a consumed callback after unblock and records a later fresh ban',async()=>{
@@ -81,7 +83,10 @@ describe('durable shared ban transitions and administrator notices',()=>{
   expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:0});
   await handleBanNotice(e,(await pendingNotice(e))!);
   expect(sent).toHaveLength(1);
-  expect(sent[0].params.text).toBe('🚫 该用户因命中拦截规则已被自动封禁。\n触发规则：#7 · 正则表达式\n规则内容：广告[0-9]+\n当前状态：已解除封禁。');
+  expect(sent[0].params.text).toContain('操作来源：拦截规则自动封禁\n触发规则：#7 · 正则表达式\n规则内容：广告[0-9]+');
+  expect(sent[0].params.text).toContain('这是历史操作记录，不代表当前状态；当前状态请查看置顶资料卡。');
+  expect(sent[0].params.text).not.toContain('当前状态：已解除封禁');
+  expect(sent[0].params.reply_markup).toMatchObject({inline_keyboard:[[{text:'查看当前资料卡'}]]});
   expect(await one(e,'SELECT rule_pattern,rule_version FROM ban_events WHERE id=?',result.eventId)).toEqual({rule_pattern:'广告[0-9]+',rule_version:2});
   expect(JSON.stringify(await all(e,'SELECT detail FROM audit_logs'))).not.toContain('广告');
  });
@@ -109,6 +114,7 @@ describe('durable shared ban transitions and administrator notices',()=>{
   await handleBanNotice(unknown,notice);await handleBanNotice(unknown,notice);
   expect(sent).toBe(1);
   expect(await one(e,"SELECT notice_status FROM ban_events WHERE notice_status='unknown'")).toEqual({notice_status:'unknown'});
+  expect(await one(e,"SELECT json_extract(payload,'$.urgent') urgent FROM jobs WHERE kind='card' AND state='pending'")).toEqual({urgent:1});
   expect(await all(e,"SELECT event FROM audit_logs WHERE event='ban_notice_unavailable'")).toEqual([{event:'ban_notice_unavailable'}]);
  });
  it('replays a confirmed operation after event persistence failed without a second send',async()=>{
@@ -130,5 +136,16 @@ describe('durable shared ban transitions and administrator notices',()=>{
   const {e,sent}=await setup();await setBlocked(e,job(90),'20001',true,{source:'manual'});
   await handleBanNotice(e,{...(await pendingNotice(e))!,user_key:'ban:20002'});
   expect(sent).toEqual([]);
+ });
+ it('durably requests a visible card warning when Telegram explicitly rejects the topic notice',async()=>{
+  const {e}=await setup();
+  const rejected={...e,BOT:{idFromName:(name:string)=>name,get:()=>({fetch:async()=>Response.json({status:'failed',code:403,reason:'Synthetic notice rejection'})})}} as unknown as Env;
+  await setBlocked(rejected,job(100),'20001',true,{source:'manual'});
+  await run(e,"UPDATE jobs SET state='done' WHERE kind='card'");
+  await handleBanNotice(rejected,(await pendingNotice(rejected))!);
+  expect(await one(e,"SELECT notice_status FROM ban_events WHERE notice_status='failed'")).toEqual({notice_status:'failed'});
+  expect(await one(e,"SELECT blocked FROM users WHERE tgid='20001'")).toEqual({blocked:1});
+  expect(await one(e,"SELECT json_extract(payload,'$.urgent') urgent FROM jobs WHERE kind='card' AND state='pending'")).toEqual({urgent:1});
+  expect(await one(e,"SELECT phase,code FROM operations WHERE method='sendMessage'")).toEqual({phase:'failed',code:403});
  });
 });

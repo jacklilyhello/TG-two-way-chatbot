@@ -33,7 +33,7 @@ describe('durable scheduling',()=>{
   await setSetting(e,'card_state:42:1',JSON.stringify([99,'','',null,1,null,0,'Asia/Singapore']));
   const notifications:unknown[]=[];
   await recover({...e,JOBS:{send:async(body:unknown)=>{notifications.push(body);}}} as Env);
-  expect(notifications).toEqual([{key:'42'},{key:'system'},{key:'system'}]);
+  expect(notifications).toEqual([{key:'card:42'},{key:'42'},{key:'system'},{key:'system'}]);
   vi.mocked(fetch).mockImplementation(async request=>{
    const path=new URL(String(request)).pathname;
    if(path.endsWith('/getUserProfilePhotos'))return Response.json({ok:true,result:{photos:[]}});

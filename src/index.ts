@@ -1,6 +1,6 @@
 import type {Env,TGUpdate} from './types';
 import {validUpdate,accept} from './ingress';
-import {all,run,setting,setSetting,now,audit,enqueue,armWork} from './db';
+import {all,run,setting,setSetting,now,audit,enqueue,armWork,stmt} from './db';
 import {versionEvent} from './logs';
 import {reconcileIssued} from './operations';
 import {recoverPreparedReceipts} from './receipts';
@@ -11,6 +11,14 @@ async function wake(e:Env,key:string) {return e.CONVERSATIONS.get(e.CONVERSATION
 export async function recover(e:Env) {
  await run(e,"UPDATE jobs SET state='quarantined',error='恢复代次不匹配；禁止重放' WHERE epoch!=? AND state NOT IN ('done','quarantined')",e.RECOVERY_EPOCH);
  await recoverPreparedReceipts(e);
+ // Upgrade every existing card once, including users who never send another
+ // message. The job ledger spreads API work across ordinary recovery wakes;
+ // the marker and inserts commit together and preserve cards and bindings.
+ const cardUpgrade=`profile-ui-v2:${e.RECOVERY_EPOCH}`,time=now();
+ await e.DB.batch([
+  stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) SELECT ?||':'||tgid||':'||binding_version,'card:'||tgid,'card',json_object('userId',tgid,'version',binding_version,'threadId',thread_id,'urgent',json('true')),'pending',?,?,? FROM users WHERE thread_id IS NOT NULL AND card_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM settings WHERE key=?)",cardUpgrade,time,e.RECOVERY_EPOCH,time,cardUpgrade),
+  stmt(e,"INSERT OR IGNORE INTO settings(key,value) VALUES(?,'queued')",cardUpgrade)
+ ]);
  // A manually recovered binding can unblock originals whose first topic setup failed.
  const stranded=await all<{id:number;user_id:string;payload:string;binding_version:number}>(e,"SELECT m.id,m.user_id,m.payload,u.binding_version FROM messages m JOIN users u ON u.tgid=m.user_id WHERE m.epoch=? AND m.direction='in' AND m.business=1 AND m.delivery='pending' AND m.tombstone=0 AND u.thread_id IS NOT NULL ORDER BY m.id LIMIT 40",e.RECOVERY_EPOCH);
  for(const m of stranded)await enqueue(e,m.user_id,'update',{update:{update_id:0,message:JSON.parse(m.payload)}},`route:${m.id}:${m.binding_version}`);

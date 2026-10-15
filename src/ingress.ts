@@ -1,6 +1,7 @@
 import type {Env,TGUpdate,TGMessage,UserRow} from './types';
 import {one,stmt,now} from './db';
 import {adminBinding,internalForward,type PrivateAdmission} from './security';
+import {captureRuleInput} from './rule-workflow';
 interface Action {token:string;kind:string;user_id:string;actor_id:string;thread_id:number;version:number;payload:string;expires_at:number;used:number}
 export function authorized(e:Env,id?:number) {return !!id&&e.ADMIN_IDS.split(',').map(s=>s.trim()).includes(String(id));}
 export function command(m:TGMessage) {return (m.text??'').startsWith('/');}
@@ -23,15 +24,27 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
  else if(m&&String(m.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,m.from?.id)&&!m.sender_chat) {
   const target=m.text?.match(/^\/tj(?:@[\w]+)?\s+(\d{1,16})(?:\s|$)/i);
   current=await one<UserRow>(e,'SELECT * FROM users WHERE thread_id=?',m.message_thread_id??0);
-  uid=target?.[1]??current?.tgid;key=uid??'admin';dir='out';
+  uid=target?.[1]??current?.tgid;key=uid??`admin:${m.from!.id}`;dir='out';
  } else if(cb&&String(cb.message?.chat.id)===e.ADMIN_CHAT_ID&&authorized(e,cb.from.id)) {
   const token=cb.data?.match(/^a:([a-f0-9]{32})$/)?.[1];
   if(token) action=await one<Action>(e,'SELECT * FROM callback_actions WHERE token=?',token);
-  if(action) {uid=action.user_id;key=uid||'admin';current=uid?await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid):null;}
-  else key='admin';
+  if(action) {uid=action.user_id;key=uid||`admin:${cb.from.id}`;current=uid?await one<UserRow>(e,'SELECT * FROM users WHERE tgid=?',uid):null;}
+  else key=`admin:${cb.from.id}`;
+  // A confirmed ban does not need to wait for an unrelated Telegram upload or
+  // deletion in the business lane. Validate the whole card context before
+  // admitting it to this user-specific moderation lane; callbacks still pass
+  // the administrator handler's checks before changing any state.
+  if(action&&current&&(action.kind==='card_block'||action.kind==='card_unblock')&&
+   (action.actor_id==='*'||action.actor_id===String(cb.from.id))&&action.expires_at>=time&&
+   current.binding_version===action.version&&current.thread_id===action.thread_id&&
+   cb.message?.message_thread_id===action.thread_id&&cb.message.message_id===current.card_id&&
+   String(cb.message.from?.id)===e.EXPECTED_BOT_ID) {
+   try {if(JSON.parse(action.payload).instance===e.INSTANCE_ID)key=`moderation:${current.tgid}`;}catch{}
+  }
  }
  const privateAdmission:PrivateAdmission|undefined=m&&uid&&dir==='in'?{instance:e.INSTANCE_ID,userId:uid,thread:current?.thread_id??null,version:current?.binding_version??0,blocked:current?.blocked===1}:undefined;
- const p={update:u,...(privateAdmission?{privateAdmission}:{}),...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
+ const ruleInputAdmission=m&&dir==='out'?await captureRuleInput(e,m):null;
+ const p={update:u,...(privateAdmission?{privateAdmission}:{}),...(m&&dir==='out'?{ruleInputAdmission}:{}),...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
  const sql:D1PreparedStatement[]=[
   stmt(e,'INSERT OR IGNORE INTO inbox_updates(update_id,payload,received_at) VALUES(?,?,?)',u.update_id,JSON.stringify(u),time),
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES(?,?,?,?,'pending',?,?,?)",`u:${u.update_id}`,key,'update',JSON.stringify(p),time,e.RECOVERY_EPOCH,time)

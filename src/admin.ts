@@ -5,8 +5,11 @@ import {deleteSingle} from './messaging';
 import {DEFAULT_FIXED_TEXT} from './settings';
 import {admittedBindingMatches,internalForward} from './security';
 import {reserveDeliveryRetry} from './delivery-retry';
-import {rulesPanel,handleRuleCommand,handleRuleAction} from './block-rules';
+import {rulesPanel,handleRuleCommand,handleRuleAction,handleRuleInput} from './block-rules';
+import {closeRuleSession} from './rule-workflow';
 import {setBlocked} from './moderation';
+import {profileLinks,profileButtons,withProfileFallback,profileFallbackDetails,PROFILE_ENTRIES,type ProfileCallbacks,type ProfileEntry} from './profile-links';
+export {profileLinks} from './profile-links';
 
 interface Action {
  token: string; kind: string; user_id: string; actor_id: string; thread_id: number | null;
@@ -23,15 +26,6 @@ export function validUserId(value: string) {return /^[1-9]\d{0,15}$/.test(value)
 const displayName = (u: UserRow) => [u.first_name,u.last_name].filter(Boolean).join(' ') || u.tgid;
 const actionPayload = (a: Action): Params => JSON.parse(a.payload) as Params;
 
-export function profileLinks(u: Pick<UserRow,'tgid'|'username'>): [string,string,string] {
- if (u.username && /^[A-Za-z0-9_]{5,32}$/.test(u.username)) {
-  return [`https://t.me/${u.username}?profile`, `tg://resolve?domain=${u.username}&profile`, `tg://resolve?domain=${u.username}&profile`];
- }
- // The Bot API supports ID links in inline buttons. It does not guarantee that
- // a profile is accessible under the user's privacy settings on every client.
- const fallback = `tg://user?id=${u.tgid}`;
- return [fallback,fallback,fallback];
-}
 export function topicLink(e: Env, thread: number, message = thread) {
  return `https://t.me/c/${e.ADMIN_CHAT_ID.replace(/^-100/,'')}/${thread}/${message}`;
 }
@@ -134,47 +128,53 @@ export async function scheduleCard(e:Env,job:Job,u:UserRow,force=false,waitUntil
 }
 
 export async function handleCard(e:Env,job:Job) {
- const p=JSON.parse(job.payload) as {userId:string;version:number;threadId:number;force?:boolean};
+ const p=JSON.parse(job.payload) as {userId:string;version:number;threadId:number;force?:boolean;urgent?:boolean};
  const u=await user(e,p.userId);
  if(!u||u.binding_version!==p.version||u.thread_id!==p.threadId)return;
- if(await one(e,"SELECT id FROM jobs WHERE user_key=? AND kind IN ('update','clear') AND epoch=? AND state IN ('pending','retry','running') LIMIT 1",u.tgid,e.RECOVERY_EPOCH))throw new RetryLater(now()+1000);
- await refreshCardNow(e,job,u.tgid,p.force===true);
+ if(!p.urgent&&await one(e,"SELECT id FROM jobs WHERE user_key=? AND kind IN ('update','clear') AND epoch=? AND state IN ('pending','retry','running') LIMIT 1",u.tgid,e.RECOVERY_EPOCH))throw new RetryLater(now()+1000);
+ await refreshCardNow(e,job,u.tgid,p.force===true,p.urgent===true);
 }
 
 export async function refreshCard(e:Env,job:Job,userId:string,force=false,waitUntil?:(promise:Promise<unknown>)=>void):Promise<void> {
  const u=await user(e,userId);if(u?.thread_id)await scheduleCard(e,job,u,force,waitUntil);
 }
 
-function cardText(u: UserRow, timezone: string) {
+function cardText(u: UserRow, timezone: string, noticeWarning='') {
  const date = new Intl.DateTimeFormat('zh-CN',{timeZone:timezone,dateStyle:'medium',timeStyle:'short'}).format(new Date(u.first_contact));
- return `姓名：${escape(displayName(u))}\nTGID：<code>${u.tgid}</code>\n用户名：${u.username ? '@'+escape(u.username) : '未设置'}\n首次联系：${date} (${escape(timezone)})\n状态：${u.blocked ? '已封禁' : '正常'}\n资料入口受 Telegram 隐私设置与客户端支持限制。`;
+ return `姓名：${escape(displayName(u))}\nTGID：<code>${u.tgid}</code>\n用户名：${u.username ? '@'+escape(u.username) : '未设置'}\n首次联系：${date} (${escape(timezone)})\n状态：${u.blocked ? '已封禁' : '正常'}\n资料入口受 Telegram 隐私设置与客户端支持限制。${noticeWarning?'\n'+escape(noticeWarning):''}`;
 }
 // The moderation generation distinguishes normal -> blocked -> normal cycles.
 // A retried render must not recover a keyboard whose actions were consumed in
 // an earlier occurrence of the same visible state.
-const cardSignature = (u: UserRow, timezone: string) => JSON.stringify([u.card_id,u.first_name,u.last_name,u.username,u.first_contact,u.photo_id,u.blocked,u.moderation_version ?? 0,timezone]);
+const cardSignature = (u: UserRow, timezone: string) => JSON.stringify(['profile-v2',u.card_id,u.first_name,u.last_name,u.username,u.first_contact,u.photo_id,u.blocked,u.moderation_version ?? 0,timezone]);
 const cardDigest = async(value:string)=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))).map(byte=>byte.toString(16).padStart(2,'0')).join('');
 async function keyboard(e: Env, job: Job, u: UserRow, context = `card:${job.id}`) {
  const block = await createAction(e,u.blocked ? 'card_unblock' : 'card_block',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
  const clear = await createAction(e,'card_clear',u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
+ const callbacks={} as ProfileCallbacks;
+ const profileTokens:string[]=[];
+ for(const {entry} of PROFILE_ENTRIES) {
+  const token=await createAction(e,`card_profile_${entry}`,u,'*',u.thread_id,{},Number.MAX_SAFE_INTEGER,context);
+  callbacks[entry]='a:'+token;profileTokens.push(token);
+ }
  const links = profileLinks(u);
  const markup={inline_keyboard:[
-  [{text:'通用资料',url:links[0]},{text:'苹果资料',url:links[1]},{text:'安卓资料',url:links[2]}],
+  profileButtons(u),
   [{text:u.blocked ? '解除封禁' : '封禁',callback_data:'a:'+block},{text:'直达对方主页',url:links[0]}],
   [{text:'清空此对话',callback_data:'a:'+clear}]
  ]};
- return {tokens:[block,clear],markup:await setting(e,`card_no_id_links:${u.tgid}`)==='1'?withoutPrivateLinks(markup):markup};
+ return {tokens:[block,clear,...profileTokens],callbacks,markup:await setting(e,`card_no_id_links:${u.tgid}`)==='1'?withProfileFallback(markup,callbacks):markup};
 }
-function withoutPrivateLinks(markup:{inline_keyboard:Button[][]}) {
- return {inline_keyboard:markup.inline_keyboard.map(row=>row.filter(button=>!button.url?.startsWith('tg://user?id='))).filter(row=>row.length)};
-}
-async function cardCall(e:Env,key:string,method:string,params:Params,guard:IssueGuard,u:UserRow):Promise<Outcome<any>> {
+async function cardCall(e:Env,key:string,method:string,params:Params,guard:IssueGuard,u:UserRow,callbacks:ProfileCallbacks):Promise<Outcome<any>> {
  const result=await call(e,key,method,params,guard);
  // Telegram explicitly rejected these buttons, so this specific correction
  // cannot duplicate a delivered card. Unknown sends remain terminal.
  if(result.status==='failed'&&result.code===400&&/BUTTON_USER_PRIVACY_RESTRICTED/.test(result.reason)&&params.reply_markup) {
   await setSetting(e,`card_no_id_links:${u.tgid}`,'1');
-  return call(e,`${key}:without-private-links`,method,{...params,reply_markup:withoutPrivateLinks(params.reply_markup as {inline_keyboard:Button[][]})},guard);
+  // Keep the previous release's operation key: it may already identify a
+  // delivered card whose D1 card_id write was interrupted. New controls are
+  // repaired in place after recovering that known result.
+  return call(e,`${key}:without-private-links`,method,{...params,reply_markup:withProfileFallback(params.reply_markup as {inline_keyboard:Button[][]},callbacks)},guard);
  }
  return result;
 }
@@ -206,7 +206,7 @@ export async function ensureInitialCardReady(e:Env,job:Job,target:string|UserRow
   const timezone=await setting(e,'timezone','Asia/Singapore');
   const controls=await keyboard(e,job,u,`${base}:initial`);
   const creationKey=await setting(e,`card_create_key:${u.tgid}:${u.binding_version}`,`${base}:create`);
-  const result=await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text:cardText(u,timezone),parse_mode:'HTML',reply_markup:controls.markup},guard,u);
+  const result=await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text:cardText(u,timezone),parse_mode:'HTML',reply_markup:controls.markup},guard,u,controls.callbacks);
   if(result.status!=='success')return fail('create',result);
   if(!Number.isSafeInteger(result.result.message_id)||result.result.message_id<=0)return fail('create',{status:'unknown',reason:'Telegram 返回缺少有效资料卡消息 ID'});
   cardId=result.result.message_id as number;
@@ -224,16 +224,16 @@ export async function ensureInitialCardReady(e:Env,job:Job,target:string|UserRow
 }
 /** Only the card coordinator calls this in production. All administrator and
  * incoming-message paths enqueue work on that same lane. */
-export async function refreshCardNow(e: Env, job: Job, userId: string, force = false): Promise<void> {
+export async function refreshCardNow(e: Env, job: Job, userId: string, force = false, urgent = false): Promise<void> {
  let u = await user(e,userId);
  if (!u?.thread_id) return;
  if(!await ensureInitialCardReady(e,job,u))return;
  u=await user(e,userId);
  if(!u?.thread_id)return;
  const boundVersion=u.binding_version,boundThread=u.thread_id;
- const guard:IssueGuard={threadVersion:{userId:u.tgid,version:boundVersion,threadId:boundThread}};
+ const guard:IssueGuard={threadVersion:{userId:u.tgid,version:boundVersion,threadId:boundThread,moderationVersion:u.moderation_version??0},...(urgent?{priority:'moderation-card' as const}:{})};
  const photoChecked=Number(await setting(e,`profile_checked:${u.tgid}`,'0'));
- if(force||!photoChecked||now()-photoChecked>=60000) {
+ if(!urgent&&(force||!photoChecked||now()-photoChecked>=60000)) {
   const photos = await call<{photos:{file_id:string}[][]}>(e,`job:${job.id}:avatar:${userId}`,'getUserProfilePhotos',{user_id:userId,limit:1});
   if (photos.status === 'success') {
    const photo = photos.result.photos?.[0]?.at(-1)?.file_id ?? null;
@@ -246,10 +246,13 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  u = await user(e,userId);
  if(!u||u.binding_version!==boundVersion||u.thread_id!==boundThread)return;
  const timezone = await setting(e,'timezone','Asia/Singapore');
+ const failedNotice=await one<{id:number;notice_status:string}>(e,"SELECT id,notice_status FROM ban_events WHERE user_id=? AND committed=1 AND notice_status IN ('failed','unknown') ORDER BY id DESC LIMIT 1",userId);
+ const noticeWarning=failedNotice?`⚠ 封禁记录 #${failedNotice.id} 的话题通知${failedNotice.notice_status==='unknown'?'发送结果未知，未自动重发':'发送失败'}；请查看系统日志${failedNotice.notice_status==='unknown'?'或 General 的 /mb unknown':''}核查。当前封禁状态以上方为准。`:'';
  const stateKey = `card_state:${u.tgid}:${u.binding_version}`;
- if (!force && u.card_id && await setting(e,stateKey)===cardSignature(u,timezone)) return;
- const text = cardText(u,timezone);
- const signatureDigest=await cardDigest(cardSignature(u,timezone));
+ const signature=(row:UserRow)=>JSON.stringify([cardSignature(row,timezone),noticeWarning]);
+ if (!force && u.card_id && await setting(e,stateKey)===signature(u)) return;
+ const text = cardText(u,timezone,noticeWarning);
+ const signatureDigest=await cardDigest(signature(u));
  // Tokens are immutable and bind to the card and binding, so an old keyboard
  // cannot control a later card even if Telegram kept its message in history.
  const controls = await keyboard(e,job,u,`card:${job.id}:${signatureDigest}`);
@@ -265,12 +268,12 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  // New topics deliberately keep the original text card. Converting it to a
  // photo would move the current pinned panel behind the first business item.
  const initialText=existingMedia==='text'&&!!await setting(e,`card_initial:${u.tgid}:${u.binding_version}`);
- const replace = cardId && ((!initialText&&existingMedia === 'text' && u.photo_id) || (existingMedia !== 'text' && !u.photo_id));
+ const replace = !urgent&&cardId && ((!initialText&&existingMedia === 'text' && u.photo_id) || (existingMedia !== 'text' && !u.photo_id));
  if (!cardId || replace) {
   const creationKey = replace ? `${base}:replace:${cardId}:${u.photo_id ?? 'text'}` : await setting(e,`card_create_key:${u.tgid}:${u.binding_version}`,`${base}:create`);
   const result = u.photo_id
-   ? await cardCall(e,creationKey,'sendPhoto',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,photo:u.photo_id,caption:text,parse_mode:'HTML',reply_markup},guard,u)
-   : await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text,parse_mode:'HTML',reply_markup},guard,u);
+   ? await cardCall(e,creationKey,'sendPhoto',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,photo:u.photo_id,caption:text,parse_mode:'HTML',reply_markup},guard,u,controls.callbacks)
+   : await cardCall(e,creationKey,'sendMessage',{chat_id:e.ADMIN_CHAT_ID,message_thread_id:u.thread_id,text,parse_mode:'HTML',reply_markup},guard,u,controls.callbacks);
   if (result.status !== 'success' || !Number.isSafeInteger(result.result.message_id) || result.result.message_id <= 0) {
    await recordProblem(e,'card_create_unavailable',u,result);
    return;
@@ -287,27 +290,33 @@ export async function refreshCardNow(e: Env, job: Job, userId: string, force = f
  } else {
   const result = existingMedia !== 'text'
    ? u.photo_id && u.photo_id !== existingMedia
-    ? await cardCall(e,`job:${job.id}:card:${render}:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup},guard,u)
-    : await cardCall(e,`job:${job.id}:card:${render}:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup},guard,u)
-   : await cardCall(e,`job:${job.id}:card:${render}:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup},guard,u);
+    ? await cardCall(e,`job:${job.id}:card:${render}:media:${cardId}`,'editMessageMedia',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,media:{type:'photo',media:u.photo_id,caption:text,parse_mode:'HTML'},reply_markup},guard,u,controls.callbacks)
+    : await cardCall(e,`job:${job.id}:card:${render}:caption:${cardId}`,'editMessageCaption',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,caption:text,parse_mode:'HTML',reply_markup},guard,u,controls.callbacks)
+   : await cardCall(e,`job:${job.id}:card:${render}:text:${cardId}`,'editMessageText',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,text,parse_mode:'HTML',reply_markup},guard,u,controls.callbacks);
   await recordProblem(e,'card_update_failed',u,result);
   updated = result.status==='success';
   if (result.status === 'success' && u.photo_id && existingMedia !== 'text') await setSetting(e,mediaKey,u.photo_id);
  }
  // A recovered create may return an already-created card with another job's
  // keyboard. Establish this generation before retiring older controls.
- if(await setting(e,`card_no_id_links:${u.tgid}`)==='1')reply_markup=withoutPrivateLinks(reply_markup);
- const markup = await cardCall(e,`job:${job.id}:card:${render}:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup},guard,u);
+ if(await setting(e,`card_no_id_links:${u.tgid}`)==='1')reply_markup=withProfileFallback(reply_markup,controls.callbacks);
+ // Existing-card moderation edits already update text and controls together.
+ // Avoid a second edit and pin request delaying the visible result. Creation
+ // and ordinary profile repair retain their full keyboard/pinning checks.
+ const fastEdit=urgent&&!!u.card_id&&!replace&&updated;
+ const markup:Outcome=fastEdit?{status:'success',result:true}:await cardCall(e,`job:${job.id}:card:${render}:buttons:${cardId}`,'editMessageReplyMarkup',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,reply_markup},guard,u,controls.callbacks);
  await recordProblem(e,'card_buttons_failed',u,markup);
- if (markup.status==='success') await run(e,"UPDATE callback_actions SET used=-1 WHERE user_id=? AND version=? AND kind LIKE 'card_%' AND used=0 AND token NOT IN (?,?)",u.tgid,u.binding_version,...controls.tokens);
- const pin = await call(e,`job:${job.id}:card:${render}:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
+ if (markup.status==='success') await run(e,`UPDATE callback_actions SET used=-1 WHERE user_id=? AND version=? AND kind LIKE 'card_%' AND used=0 AND token NOT IN (${controls.tokens.map(()=>'?').join(',')})`,u.tgid,u.binding_version,...controls.tokens);
+ const pin:Outcome=fastEdit?{status:'success',result:true}:await call(e,`job:${job.id}:card:${render}:pin:${cardId}`,'pinChatMessage',{chat_id:e.ADMIN_CHAT_ID,message_id:cardId,disable_notification:true},guard);
  await recordProblem(e,'card_pin_failed',u,pin);
  if (updated && markup.status==='success' && pin.status==='success') {
   const current=await user(e,userId);
   if(!current||current.binding_version!==boundVersion||current.thread_id!==boundThread)return;
-  if(cardSignature(current,timezone)!==cardSignature({...u,card_id:cardId},timezone))throw new RetryLater(now()+100);
-  await setSetting(e,stateKey,cardSignature(current,timezone));
+  if(signature(current)!==signature({...u,card_id:cardId}))throw new RetryLater(now()+100);
+  await setSetting(e,stateKey,signature(current));
  }
+ const latest=await user(e,userId);
+ if(latest&&latest.binding_version===boundVersion&&latest.thread_id===boundThread&&latest.moderation_version!==u.moderation_version)throw new RetryLater(now()+100);
 }
 
 function partsAt(timestamp: number, timezone: string) {
@@ -457,6 +466,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  if (payload.instance!==e.INSTANCE_ID) {await answer(e,job,cb.id,'实例不匹配。');return;}
  if (a.kind==='panel') {
   if (!isGeneral(m) || payload.messageId!==m.message_id) {await answer(e,job,cb.id,'管理面板仅限原 General 消息。');return;}
+  await closeRuleSession(e,String(cb.from.id));
   await run(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0',stamp,a.token);
   if (payload.view==='stats' && ['today','7','30','all'].includes(String(payload.range))) await panel(e,job,String(cb.from.id),payload.range as Range);
   else if (payload.view==='users') await usersPage(e,job,String(cb.from.id),Number(payload.page)||0);
@@ -467,7 +477,7 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  }
  if(a.kind.startsWith('rule_')) {
   if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'规则管理仅限原 General 消息。');return;}
-  await answer(e,job,cb.id,await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil));return;
+  await answer(e,job,cb.id,await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today')));return;
  }
  const u = await user(e,a.user_id);
  if (a.kind==='clear_confirm') {
@@ -499,8 +509,13 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
   } else if (u.blocked!==blocked) {
    await answer(e,job,cb.id,'操作已处理，请使用当前资料卡。');return;
   }
-  await refreshCard(e,job,u.tgid,false,waitUntil);
   await answer(e,job,cb.id,blocked ? '已封禁；用户端保持静默。' : '已解除封禁。');
+ } else if(a.kind.startsWith('card_profile_')) {
+  const entry=a.kind.slice('card_profile_'.length) as ProfileEntry;
+  if(!PROFILE_ENTRIES.some(item=>item.entry===entry)) {await answer(e,job,cb.id,'资料入口已失效。');return;}
+  const details=profileFallbackDetails(u,entry);
+  const result=await notify(e,`job:${job.id}:profile-help`,u.thread_id,details.text,{reply_markup:details.reply_markup});
+  await answer(e,job,cb.id,result.status==='success'?'兼容说明已记录在本话题，可复制 TGID 核对目标。':result.status==='unknown'?'兼容说明发送结果未知，请查看话题；未自动重发。':'兼容说明发送失败，请核对机器人话题权限。');
  } else if (a.kind==='card_clear') {
   await confirmation(e,job,u,String(cb.from.id),a.thread_id!,'clear_confirm','确认清空此对话？仅删除新系统已知的用户私聊消息。管理员历史与话题保留；旧系统未记录历史无法追溯、数量未知。确认后新消息不在本次范围。',{});
   await answer(e,job,cb.id,'请在确认消息中选择。');
@@ -559,6 +574,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
  if (!m || String(m.chat.id)!==e.ADMIN_CHAT_ID) return false;
  if (!authorized(e,String(m.from?.id)) || m.sender_chat || m.from?.is_bot) return true;
  if (internalForward(e,m)) return true;
+ if(await handleRuleInput(e,job,update,waitUntil))return true;
  const text = m.text ?? '';
  const command = /^\/([a-zA-Z]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(text);
  if (!text.startsWith('/')) {
