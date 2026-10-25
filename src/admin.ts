@@ -491,8 +491,9 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  }
  if(a.kind.startsWith('broadcast_')) {
   if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'广播管理仅限原 General 消息。');return;}
-  const text=await handleBroadcastAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today'));
-  await answer(e,job,cb.id,text,false);return;
+  let answered=false;
+  const text=await handleBroadcastAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today'),async message=>{await answer(e,job,cb.id,message,false);answered=true;});
+  if(!answered)await answer(e,job,cb.id,text,false);return;
  }
  if(a.kind.startsWith('rule_')) {
   if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'规则管理仅限原 General 消息。');return;}

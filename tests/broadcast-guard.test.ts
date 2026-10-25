@@ -53,6 +53,22 @@ describe('broadcast issue guards and scheduling',()=>{
   expect(await broadcastGuardValid(e,guard,'sendMessage',params)).toBe(true);
   for(const scope of [undefined,'disabled','20002','20001,invalid'])expect(await broadcastGuardValid({...e,BROADCAST_TEST_RECIPIENT_IDS:scope},guard,'sendMessage',params)).toBe(false);
  });
+ it('does not issue to an injected recipient outside the frozen directed audience',async()=>{
+  await setup();
+  await run(base,"UPDATE broadcasts SET scope_json=?",JSON.stringify({mode:'directed',ids:['20001']}));
+  await run(base,"INSERT INTO users(tgid,first_contact,thread_id) VALUES('20002',1,21)");
+  await run(base,'INSERT INTO broadcast_recipients(broadcast_id,user_id,updated_at) VALUES(?,?,1)',guard.id,'20002');
+  expect(await broadcastGuardValid(base,guard,'sendMessage',{chat_id:'20001',text:'Synthetic broadcast'})).toBe(true);
+  const {invoke}=bot();
+  expect(await (await invoke('outside-directed','sendMessage',{chat_id:'20002',text:'Synthetic broadcast'},{...guard,userId:'20002'})).json()).toMatchObject({status:'failed',code:409});
+  expect(fetch).not.toHaveBeenCalled();
+ });
+ it.each(['not-json','null','{}','[]','{"mode":"invalid"}','{"mode":"directed","ids":[]}','{"mode":"directed","ids":["abc"]}','{"mode":"directed","ids":["20002"]}'])('fails closed rather than treating damaged or mismatched scope %s as all users',async scope=>{
+  await setup();await run(base,'UPDATE broadcasts SET scope_json=?',scope);
+  const {invoke}=bot();
+  expect(await (await invoke('damaged-scope','sendMessage',{chat_id:'20001',text:'Synthetic broadcast'},guard)).json()).toMatchObject({status:'failed',code:409});
+  expect(fetch).not.toHaveBeenCalled();
+ });
  it('does not let a slow broadcast network request block ordinary chat or callback acknowledgements',async()=>{
   await setup();let clock=100000;
   vi.spyOn(Date,'now').mockImplementation(()=>clock);

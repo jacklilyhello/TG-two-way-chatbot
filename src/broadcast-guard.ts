@@ -1,6 +1,6 @@
 import type {Env,Params} from './types';
 import {one} from './db';
-import {broadcastParts,broadcastTestRecipients,type BroadcastGuard} from './broadcast-delivery';
+import {broadcastParts,broadcastTestRecipients,normalizeBroadcastAudience,type BroadcastGuard} from './broadcast-delivery';
 export type {BroadcastGuard} from './broadcast-delivery';
 
 /** Recheck the immutable recipient/content and current eligibility immediately
@@ -10,11 +10,15 @@ export async function broadcastGuardValid(e:Env,g:BroadcastGuard,method:string,p
  let scope:string[]|null;
  try {scope=broadcastTestRecipients(e);}catch{return false;}
  if(scope&&!scope.includes(g.userId))return false;
- const row=await one<{text:string;photo:string|null;actor_id:string}>(e,`SELECT b.text,b.photo,b.actor_id FROM broadcasts b
+ const row=await one<{text:string;photo:string|null;actor_id:string;scope_json:string}>(e,`SELECT b.text,b.photo,b.actor_id,b.scope_json FROM broadcasts b
  JOIN broadcast_recipients r ON r.broadcast_id=b.id JOIN users u ON u.tgid=r.user_id
  WHERE b.id=? AND b.instance_id=? AND b.bot_id=? AND b.epoch=? AND b.state='sending' AND b.snapshot_ready=1
  AND r.user_id=? AND r.state='pending' AND r.part_index=? AND u.blocked=0 AND u.thread_id IS NOT NULL`,g.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,e.RECOVERY_EPOCH,g.userId,g.part);
  if(!row||!e.ADMIN_IDS.split(/[\s,]+/).includes(row.actor_id))return false;
+ try {
+  const audience=normalizeBroadcastAudience(JSON.parse(row.scope_json));
+  if(audience.mode==='directed'&&!audience.ids.includes(g.userId))return false;
+ }catch{return false;}
  const part=broadcastParts(row.text,row.photo)[g.part];
  if(!part||part.method!==method||String(params.chat_id)!==g.userId)return false;
  const expected={chat_id:g.userId,...part.params};
