@@ -20,6 +20,7 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string; TELEGRAM_WEBHOOK_SECRET: string;
   INSTANCE_ID: string; EXPECTED_BOT_ID: string; ADMIN_CHAT_ID: string; ADMIN_IDS: string;
   VERSION: string; PAUSED?: string; RECOVERY_EPOCH: string;
+  BROADCAST_TEST_RECIPIENT_IDS?: string;
 }
 export interface UserRow {tgid: string; first_name: string; last_name: string; username: string | null; first_contact: number; blocked: number; moderation_version?: number; thread_id: number | null; binding_version: number; card_id: number | null; photo_id: string | null}
 export interface Job {id: number; dedupe: string; user_key: string; kind: string; payload: string; state: string; due_at: number; attempts: number; epoch: string; created_at: number}

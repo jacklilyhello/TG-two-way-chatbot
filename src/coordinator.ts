@@ -6,6 +6,7 @@ import {handleMessage,clearConversation,handleReaction,handleDeliveryNotice,hand
 import {user} from './db';
 import {flushLogs,bootstrap} from './logs';
 import {handleBanNotice} from './moderation';
+import {handleBroadcast} from './broadcast-delivery';
 export class ConversationCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
@@ -87,6 +88,7 @@ export class ConversationCoordinator {
 }
 export async function execute(e:Env,j:Job,waitUntil?:(promise:Promise<unknown>)=>void) {
  const p=JSON.parse(j.payload);
+ if(j.kind==='broadcast'){await handleBroadcast(e,j);return;}
  if(j.kind==='ban-notice'){await handleBanNotice(e,j,waitUntil);return;}
  if(j.kind==='card'){await handleCard(e,j);return;}
  if(j.kind==='delivery-notice'){await handleDeliveryNotice(e,j,waitUntil);return;}

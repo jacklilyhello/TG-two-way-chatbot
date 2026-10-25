@@ -107,6 +107,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          BROADCAST_TEST_RECIPIENT_IDS: ${{ secrets.BROADCAST_TEST_RECIPIENT_IDS }}
           BACKUP_AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
         run: node .deployment-control/scripts/deploy-instance.mjs
       - name: Encrypt private export

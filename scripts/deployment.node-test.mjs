@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { validateConfig, validateIsolation, renderWrangler, requireActions } from './instance-config.mjs';
 import { assertBotPermissions, assertRemoteIdentity, assertQueueConsumers, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease, awaitReleaseHealth, apiClient, telegramClient } from './deployment-lib.mjs';
-import { runInstance } from './deploy-instance.mjs';
+import { runInstance, validateBroadcastTestRecipients } from './deploy-instance.mjs';
 import { drillPlan, renderDrill } from './reliability-drill-lib.mjs';
 
 const a = JSON.parse(await readFile(new URL('../instances/test-a.example.json', import.meta.url)));
@@ -12,6 +12,22 @@ const b = JSON.parse(await readFile(new URL('../instances/test-b.example.json', 
 const id = '11111111-1111-1111-1111-111111111111';
 const support = JSON.parse(await readFile(new URL('../instances/prod-support.example.json', import.meta.url)));
 const ad = JSON.parse(await readFile(new URL('../instances/prod-ad.example.json', import.meta.url)));
+
+test('broadcast test restrictions validate bounded explicit identities without leaking input', () => {
+  for (const instance of ['test-a', 'test-b']) {
+    assert.equal(validateBroadcastTestRecipients(instance), '');
+    assert.equal(validateBroadcastTestRecipients(instance, ''), '');
+    assert.equal(validateBroadcastTestRecipients(instance, ' 10001, 20001 '), '10001,20001');
+    assert.equal(validateBroadcastTestRecipients(instance, Array.from({ length: 20 }, (_, i) => String(i + 1)).join(',')).split(',').length, 20);
+    for (const value of [' ', '0', '-10001', '01', '10001,', ',10001', '10001,10001', '9007199254740992', 'PRIVATE_RECIPIENT_MARKER', Array.from({ length: 21 }, (_, i) => String(i + 1)).join(','), null, ['10001']]) {
+      assert.throws(() => validateBroadcastTestRecipients(instance, value), error => error.message === 'Invalid broadcast test recipient restriction');
+    }
+  }
+  for (const instance of ['prod-support', 'prod-ad']) {
+    assert.equal(validateBroadcastTestRecipients(instance), '');
+    assert.throws(() => validateBroadcastTestRecipients(instance, 'PRIVATE_RECIPIENT_MARKER'), error => error.message === 'Broadcast test recipient restriction is allowed only on test instances');
+  }
+});
 
 test('instances cannot inherit another instance resource or select another private config', () => {
   assert.throws(() => validateConfig(a, 'test-b'));
@@ -180,6 +196,7 @@ function deploymentFixture(raw = support, options = {}) {
   const events = [];
   const logs = [];
   const files = [];
+  const secretInputs = [];
   const existing = options.existing === true;
   const database = { uuid: resourceIds.d1_id, name: config.d1_name };
   const job = { queue_id: resourceIds.queue_id, queue_name: config.queue_name, consumers: [{ type: 'worker', script: config.worker_name }], producers: [{ type: 'worker', script: config.worker_name }] };
@@ -239,11 +256,38 @@ function deploymentFixture(raw = support, options = {}) {
       if (new URL(url).pathname === '/health') return Response.json({ version: env.RELEASE_SHA });
       return Response.json({ ok: true, paused: true, issued: 0, version: options.statusVersion ?? env.RELEASE_SHA, jobs: [] });
     },
-    wrangler: async (_args, request) => { events.push({ platform: 'wrangler', method: request.label }); },
+    wrangler: async (args, request) => { events.push({ platform: 'wrangler', method: request.label }); if (args[0] === 'secret') secretInputs.push(JSON.parse(request.input)); },
   };
   const mutations = () => events.filter(event => event.platform === 'wrangler' || event.platform === 'cf' && event.method !== 'GET' || event.platform === 'telegram' && event.method === 'setWebhook' || event.platform === 'worker' && event.method !== 'GET');
-  return { config, env, dependencies, events, logs, files, mutations, run: () => runInstance(env, dependencies) };
+  return { config, env, dependencies, events, logs, files, secretInputs, mutations, run: () => runInstance(env, dependencies) };
 }
+
+test('test recipient restrictions are installed only as selected Worker Secrets and missing values disable stale restrictions', async () => {
+  for (const config of [a, b]) {
+    for (const value of ['', '10001, 20001']) {
+      const fixture = deploymentFixture(withIds(config), { existing: true, env: { BROADCAST_TEST_RECIPIENT_IDS: value } });
+      await fixture.run();
+      assert.equal(fixture.secretInputs.length, 1);
+      assert.equal(fixture.secretInputs[0].BROADCAST_TEST_RECIPIENT_IDS, value ? '10001,20001' : 'disabled');
+      assert(fixture.files.every(file => !Object.hasOwn(file.vars, 'BROADCAST_TEST_RECIPIENT_IDS')));
+      assert(!fixture.logs.join('\n').includes('10001'));
+      assert(!fixture.logs.join('\n').includes('20001'));
+    }
+  }
+  const production = deploymentFixture(withIds(support), { existing: true });
+  await production.run();
+  assert(!Object.hasOwn(production.secretInputs[0], 'BROADCAST_TEST_RECIPIENT_IDS'));
+});
+
+test('production or malformed test recipient restrictions fail before any external request or write', async () => {
+  for (const config of [support, ad, a, b]) {
+    const fixture = deploymentFixture(withIds(config), { existing: true, env: { BROADCAST_TEST_RECIPIENT_IDS: 'PRIVATE_RECIPIENT_MARKER' } });
+    await assert.rejects(fixture.run(), error => !error.message.includes('PRIVATE_RECIPIENT_MARKER') && /recipient restriction/.test(error.message));
+    assert.deepEqual(fixture.events, []);
+    assert.deepEqual(fixture.files, []);
+    assert.deepEqual(fixture.logs, []);
+  }
+});
 
 test('both production templates initialize separately with all read preflight before any create', async () => {
   validateIsolation([support, ad]);

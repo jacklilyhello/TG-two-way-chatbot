@@ -5,9 +5,22 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readManifests, validateConfig, validateIsolation, renderWrangler, requireActions } from './instance-config.mjs';
 import { apiClient, telegramClient, wrangler, assertBotPermissions, assertRemoteIdentity, assertProjectWorkerIsolation, planInstanceResources, assertPlannedQueueOwnership, provisionPlannedResources, assertWebhookChange, assertWebhookOwnership, assertRouteIsolation, installPausedRelease, awaitReleaseHealth } from './deployment-lib.mjs';
 
+/** Keep recipient identities in the selected Environment and Worker Secrets.
+ * Missing configuration intentionally disables test broadcasts, including when
+ * a previous release installed a now-removed allowlist. */
+export function validateBroadcastTestRecipients(instance, value = '') {
+  if (value === '') return '';
+  if (!['test-a', 'test-b'].includes(instance)) throw new Error('Broadcast test recipient restriction is allowed only on test instances');
+  if (typeof value !== 'string') throw new Error('Invalid broadcast test recipient restriction');
+  const ids = value.split(',').map(id => id.trim());
+  if (!ids.length || ids.length > 20 || ids.some(id => !/^[1-9]\d{0,15}$/.test(id) || !Number.isSafeInteger(Number(id))) || new Set(ids).size !== ids.length) throw new Error('Invalid broadcast test recipient restriction');
+  return ids.join(',');
+}
+
 export async function runInstance(env = process.env, dependencies = {}) {
   requireActions(env);
   const config = validateConfig(JSON.parse(env.INSTANCE_CONFIG_JSON || 'null'), env.INSTANCE_ID);
+  const broadcastTestRecipients = validateBroadcastTestRecipients(config.instance_id, env.BROADCAST_TEST_RECIPIENT_IDS);
   const base = dependencies.base ?? JSON.parse(await readFile('wrangler.jsonc', 'utf8'));
   if (base.migrations?.some(m => m.deleted_classes?.length || m.transferred_classes?.length)) throw new Error('Destructive/transferred Durable Object migrations require a separate reviewed recovery procedure');
   const manifests = dependencies.manifests ?? await readManifests(fileURLToPath(new URL('../instances', import.meta.url)));
@@ -130,7 +143,7 @@ export async function runInstance(env = process.env, dependencies = {}) {
       migrate: () => invoke(['d1', 'migrations', 'apply', 'DB', '--remote', '--config', configPath], { label: 'compatible migrations' }),
       pause: () => invoke(['d1', 'execute', 'DB', '--remote', '--command', "INSERT INTO settings(key,value) VALUES('paused','1') ON CONFLICT(key) DO UPDATE SET value='1'", '--config', configPath], { label: 'persistent outbound pause' }),
       uploadPaused: () => invoke(['deploy', '--config', configPath], { label: 'instance deployment' }),
-      installSecrets: () => invoke(['secret', 'bulk', '--config', configPath], { input: JSON.stringify({ TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET: env.TELEGRAM_WEBHOOK_SECRET }), label: 'instance secrets' }),
+      installSecrets: () => invoke(['secret', 'bulk', '--config', configPath], { input: JSON.stringify({ TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET: env.TELEGRAM_WEBHOOK_SECRET, ...(['test-a', 'test-b'].includes(config.instance_id) ? { BROADCAST_TEST_RECIPIENT_IDS: broadcastTestRecipients || 'disabled' } : {}) }), label: 'instance secrets' }),
       activate: async () => {
         workerConfig.vars.PAUSED = 'false';
         await write(configPath, JSON.stringify(workerConfig, null, 2), { mode: 0o600 });

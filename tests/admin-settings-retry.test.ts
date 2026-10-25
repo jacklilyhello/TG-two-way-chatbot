@@ -42,7 +42,7 @@ describe('administrator settings mutation retry boundaries',()=>{
   const old=await command(e,1001,item.view,item.value);oldJobId=old.job.id;
   await expect(handleAdmin(e,old.job,old.update)).rejects.toBeInstanceOf(RetryLater);
   expect(await setting(e,item.key)).toBe(item.value);
-  expect(await applied(e,old.job)).toEqual({update:old.update,ruleInputAdmission:null,adminSettingApplied:item.key});
+  expect(await applied(e,old.job)).toEqual({update:old.update,ruleInputAdmission:null,broadcastInputAdmission:null,adminSettingApplied:item.key});
   expect(await all(e,'SELECT event FROM audit_logs')).toEqual([{event:item.event}]);
   expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE kind='logs'")).toEqual({n:1});
   const later=await command(e,1002,item.view,item.later);
@@ -64,13 +64,13 @@ describe('administrator settings mutation retry boundaries',()=>{
   await run(e,"CREATE TRIGGER reject_setting_audit BEFORE INSERT ON audit_logs BEGIN SELECT RAISE(ABORT,'synthetic D1 mutation failure'); END");
   await expect(handleAdmin(e,task.job,task.update)).rejects.toThrow();
   expect(await setting(e,item.key)).toBe(item.initial);
-  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null});
+  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,broadcastInputAdmission:null});
   expect(await all(e,'SELECT id FROM audit_logs')).toEqual([]);
   expect(await all(e,"SELECT id FROM jobs WHERE kind IN ('logs','bootstrap')")).toEqual([]);
   await run(e,'DROP TRIGGER reject_setting_audit');
   await handleAdmin(e,task.job,task.update);
   expect(await setting(e,item.key)).toBe(item.value);
-  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,adminSettingApplied:item.key});
+  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,broadcastInputAdmission:null,adminSettingApplied:item.key});
   expect(await all(e,'SELECT event FROM audit_logs')).toEqual([{event:item.event}]);
   expect(await one(e,"SELECT COUNT(*) n FROM jobs WHERE kind='logs'")).toEqual({n:1});
  });
@@ -84,7 +84,7 @@ describe('administrator settings mutation retry boundaries',()=>{
   const task=await command(e,1004,'logtopic','400');
   await handleAdmin(e,task.job,task.update);
   expect(await setting(e,'log_thread_id')).toBe('300');
-  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null});
+  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,broadcastInputAdmission:null});
   expect(await all(e,'SELECT id FROM audit_logs')).toEqual([]);
   expect(await one(e,"SELECT thread_id FROM users WHERE tgid='20001'")).toEqual({thread_id:400});
  });
@@ -94,7 +94,7 @@ describe('administrator settings mutation retry boundaries',()=>{
   const task=await command(e,1005,'timezone','Asia/Tokyo');
   await Promise.all([handleAdmin(e,task.job,task.update),handleAdmin(e,task.job,task.update)]);
   expect(await setting(e,'timezone')).toBe('Asia/Tokyo');
-  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,adminSettingApplied:'timezone'});
+  expect(await applied(e,task.job)).toEqual({update:task.update,ruleInputAdmission:null,broadcastInputAdmission:null,adminSettingApplied:'timezone'});
   expect(await all(e,'SELECT event FROM audit_logs')).toEqual([{event:'setting_changed'}]);
  });
 });

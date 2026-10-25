@@ -4,6 +4,7 @@ import {all,run,setting,setSetting,now,audit,enqueue,armWork,stmt} from './db';
 import {versionEvent} from './logs';
 import {reconcileIssued} from './operations';
 import {recoverPreparedReceipts} from './receipts';
+import {recoverBroadcasts} from './broadcast-delivery';
 export {BotCoordinator} from './bot';
 export {ConversationCoordinator} from './coordinator';
 function secretMatches(a:string,b:string) {if(!a||!b)return false;let diff=a.length^b.length;for(let i=0;i<Math.max(a.length,b.length);i++)diff|=(a.charCodeAt(i)||0)^(b.charCodeAt(i)||0);return diff===0;}
@@ -11,6 +12,7 @@ async function wake(e:Env,key:string) {return e.CONVERSATIONS.get(e.CONVERSATION
 export async function recover(e:Env) {
  await run(e,"UPDATE jobs SET state='quarantined',error='恢复代次不匹配；禁止重放' WHERE epoch!=? AND state NOT IN ('done','quarantined')",e.RECOVERY_EPOCH);
  await recoverPreparedReceipts(e);
+ await recoverBroadcasts(e);
  // Upgrade every existing card once, including users who never send another
  // message. The job ledger spreads API work across ordinary recovery wakes;
  // the marker and inserts commit together and preserve cards and bindings.

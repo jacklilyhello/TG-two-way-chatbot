@@ -10,6 +10,10 @@ const authorized = (e:Env,actor:string) => e.ADMIN_IDS.split(/[\s,]+/).includes(
 /** Every recovery path must resolve the latest reserved attempt, including
  * when its external success has not yet reached messages.private_id. */
 export async function latestDelivery(e:Env,row:MessageRow) {
+  if(row.direction==='broadcast') {
+    const content=JSON.parse(row.payload) as {broadcastId:string;partIndex:number;method:string};
+    return {key:`broadcast:${content.broadcastId}:${row.user_id}:${content.partIndex}`,method:content.method,members:null as number[]|null,attempt:null};
+  }
   const attempt = await one<DeliveryAttempt>(e,'SELECT * FROM delivery_attempts WHERE message_id=? AND epoch=? ORDER BY attempt DESC LIMIT 1',row.id,e.RECOVERY_EPOCH);
   if (attempt) {
     const fallback = await one(e,'SELECT op_key FROM operations WHERE op_key=?',`${e.RECOVERY_EPOCH}:${attempt.op_key}:without-reply`);
