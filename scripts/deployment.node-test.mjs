@@ -332,6 +332,51 @@ test('incomplete, duplicate or misnamed project identity fails closed while unre
   assert.deepEqual(botConflict.mutations(), []);
 });
 
+function independentWorker() {
+  const settings = workerSettings({ ...b, instance_id: a.instance_id, d1_id: '4'.repeat(32), queue_name: 'independent-jobs' });
+  for (const binding of settings.bindings) if (binding.type === 'durable_object_namespace') binding.namespace_id = `independent-${binding.name}`;
+  return { name: 'independent-telegram-application', settings };
+}
+
+test('independent applications with complete identities do not claim the project namespace or generic instance label', async () => {
+  for (const withDrillMarker of [false, true]) {
+    const worker = independentWorker();
+    if (withDrillMarker) worker.settings.bindings.push({ name: 'DRILL_RUN_ID', type: 'plain_text', text: '12345-1' });
+    const fixture = deploymentFixture(withIds(a), { existing: true, workers: [worker] });
+    await fixture.run();
+    assert(fixture.files.length > 0);
+    assert(fixture.files.every(file => file.name === a.worker_name));
+  }
+});
+
+test('independent identity fields retain all selected Bot, Forum, database, queue and namespace collision checks', async () => {
+  const collisions = [
+    ['EXPECTED_BOT_ID', { text: a.expected_bot_id }, /Bot is already bound/],
+    ['ADMIN_CHAT_ID', { text: a.admin_chat_id }, /Admin Forum.*separate Forum/],
+    ['DB', { database_id: resourceIds.d1_id }, /shares this D1/],
+    ['JOBS', { queue_name: a.queue_name }, /shares a queue/],
+    ['BOT', { namespace_id: `${a.instance_id}-bot` }, /shares a Durable Object/],
+  ];
+  for (const [field, change, expected] of collisions) {
+    const worker = independentWorker();
+    Object.assign(worker.settings.bindings.find(binding => binding.name === field), change);
+    const fixture = deploymentFixture(withIds(a), { existing: true, workers: [worker] });
+    await assert.rejects(fixture.run(), expected);
+    assert.deepEqual(fixture.mutations(), []);
+  }
+});
+
+test('incomplete or duplicate independent identities remain blocked before writes', async () => {
+  for (const malformed of ['missing', 'duplicate']) {
+    const worker = independentWorker();
+    if (malformed === 'missing') worker.settings.bindings = worker.settings.bindings.filter(binding => binding.name !== 'EXPECTED_BOT_ID');
+    else worker.settings.bindings.push({ name: 'EXPECTED_BOT_ID', type: 'plain_text', text: b.expected_bot_id });
+    const fixture = deploymentFixture(withIds(a), { existing: true, workers: [worker] });
+    await assert.rejects(fixture.run(), /ownership cannot be confirmed/);
+    assert.deepEqual(fixture.mutations(), []);
+  }
+});
+
 test('a full inventory page without metadata still reads subsequent Workers before creating', async () => {
   const other = { ...ad, admin_chat_id: support.admin_chat_id };
   const fixture = deploymentFixture(support, { workers: [{ name: ad.worker_name, settings: workerSettings(other) }] });
