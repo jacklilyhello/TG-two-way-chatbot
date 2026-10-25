@@ -2,6 +2,7 @@ import type {Env,TGUpdate,TGMessage,UserRow} from './types';
 import {one,stmt,now} from './db';
 import {adminBinding,internalForward,type PrivateAdmission} from './security';
 import {captureRuleInput} from './rule-workflow';
+import {captureBroadcastInput} from './broadcast-workflow';
 interface Action {token:string;kind:string;user_id:string;actor_id:string;thread_id:number;version:number;payload:string;expires_at:number;used:number}
 export function authorized(e:Env,id?:number) {return !!id&&e.ADMIN_IDS.split(',').map(s=>s.trim()).includes(String(id));}
 export function command(m:TGMessage) {return (m.text??'').startsWith('/');}
@@ -44,7 +45,8 @@ export async function accept(e:Env,u:TGUpdate):Promise<string> {
  }
  const privateAdmission:PrivateAdmission|undefined=m&&uid&&dir==='in'?{instance:e.INSTANCE_ID,userId:uid,thread:current?.thread_id??null,version:current?.binding_version??0,blocked:current?.blocked===1}:undefined;
  const ruleInputAdmission=m&&dir==='out'?await captureRuleInput(e,m):null;
- const p={update:u,...(privateAdmission?{privateAdmission}:{}),...(m&&dir==='out'?{ruleInputAdmission}:{}),...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
+ const broadcastInputAdmission=m&&dir==='out'?await captureBroadcastInput(e,m):null;
+ const p={update:u,...(privateAdmission?{privateAdmission}:{}),...(m&&dir==='out'?{ruleInputAdmission,broadcastInputAdmission}:{}),...(m&&dir==='out'&&(m.message_thread_id??0)>1?{adminBinding:adminBinding(e,m,current)}:{})};
  const sql:D1PreparedStatement[]=[
   stmt(e,'INSERT OR IGNORE INTO inbox_updates(update_id,payload,received_at) VALUES(?,?,?)',u.update_id,JSON.stringify(u),time),
   stmt(e,"INSERT OR IGNORE INTO jobs(dedupe,user_key,kind,payload,state,due_at,epoch,created_at) VALUES(?,?,?,?,'pending',?,?,?)",`u:${u.update_id}`,key,'update',JSON.stringify(p),time,e.RECOVERY_EPOCH,time)

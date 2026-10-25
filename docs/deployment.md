@@ -28,7 +28,10 @@
 | Secret | `TELEGRAM_BOT_TOKEN` | 此实例独有的测试/正式 Bot Token |
 | Secret | `TELEGRAM_WEBHOOK_SECRET` | 32–256 位随机字母、数字、下划线或连字符 |
 | Secret | `INSTANCE_CONFIG_JSON` | 按模板填写的完整私有 JSON，建议紧凑单行格式 |
+| Secret，仅测试实例 | `BROADCAST_TEST_RECIPIENT_IDS` | `test-a` / `test-b` 广播验收允许的收件人 TGID，逗号分隔，1–20 个唯一正整数；不填则关闭测试实例广播发送 |
 | Variable，可选 | `BACKUP_AGE_RECIPIENT` | 加密导出的 age 公钥；私钥离线保管 |
+
+测试广播同时受此名单和用户当前状态限制，名单只缩小当前实例的合格接收范围，不授予管理员权限。名单在预览及实际发送前均核对。真实账号值只保存在对应 Environment Secret，通过 Actions 安装为同名 Worker Secret，不放入源码、普通 Variables、工作流输入或日志。移除 Environment Secret 后，下一次测试实例部署会显式安装关闭标记，避免继续沿用旧名单。正式实例不能配置此测试 Secret；部署脚本在访问 Cloudflare 前拒绝非空值。合并代码不会更新任何实例，发布仍须逐个明确选择实例。
 
 不要把真实 JSON 提交到公开仓库，也不要放入 GitHub Variable：Actions 会在步骤环境中显示普通 Variable，而 Secret 会被遮蔽。安全的本地临时文件可放在被忽略的 `.local/`；避免在终端命令、报告或截图中展开内容。Cloudflare Account ID 使用已存在的仓库 Variable，Environment 未同名覆盖时会继承它。
 

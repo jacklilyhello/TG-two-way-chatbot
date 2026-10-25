@@ -7,6 +7,7 @@ import {admittedBindingMatches,internalForward} from './security';
 import {reserveDeliveryRetry} from './delivery-retry';
 import {rulesPanel,handleRuleCommand,handleRuleAction,handleRuleInput} from './block-rules';
 import {closeRuleSession} from './rule-workflow';
+import {broadcastPanel,closeBroadcastSession,handleBroadcastInput,handleBroadcastAction} from './broadcast-workflow';
 import {setBlocked} from './moderation';
 import {profileLinks,profileButtons,withProfileFallback,profileFallbackDetails,PROFILE_ENTRIES,type ProfileCallbacks,type ProfileEntry} from './profile-links';
 export {profileLinks} from './profile-links';
@@ -386,7 +387,7 @@ async function panel(e: Env, job: Job, actor: string, range: Range) {
  const ranges: Range[] = ['today','7','30','all'];
  const buttons: Button[] = [];
  for (const r of ranges) buttons.push(await panelButton(e,job,{today:'今日','7':'7 天','30':'30 天',all:'全部'}[r],actor,{view:'stats',range:r}));
- await sendPanel(e,`job:${job.id}:panel:${range}`,text,[buttons,[await panelButton(e,job,'用户列表',actor,{view:'users',page:0}),await panelButton(e,job,'系统设置',actor,{view:'settings'})],[await panelButton(e,job,'拦截规则',actor,{view:'rules'})]]);
+ await sendPanel(e,`job:${job.id}:panel:${range}`,text,[buttons,[await panelButton(e,job,'用户列表',actor,{view:'users',page:0}),await panelButton(e,job,'系统设置',actor,{view:'settings'})],[await panelButton(e,job,'拦截规则',actor,{view:'rules'}),await panelButton(e,job,'管理员广播',actor,{view:'broadcast'})]]);
 }
 async function usersPage(e: Env, job: Job, actor: string, page: number) {
  const total = (await one<{count:number}>(e,'SELECT COUNT(*) count FROM users'))!.count;
@@ -478,16 +479,24 @@ async function callbacks(e: Env, job: Job, update: TGUpdate, waitUntil?:(promise
  if (a.kind==='panel') {
   if (!isGeneral(m) || payload.messageId!==m.message_id) {await answer(e,job,cb.id,'管理面板仅限原 General 消息。');return;}
   await closeRuleSession(e,String(cb.from.id));
+  await closeBroadcastSession(e,String(cb.from.id));
   await run(e,'UPDATE callback_actions SET used=? WHERE token=? AND used=0',stamp,a.token);
   if (payload.view==='stats' && ['today','7','30','all'].includes(String(payload.range))) await panel(e,job,String(cb.from.id),payload.range as Range);
   else if (payload.view==='users') await usersPage(e,job,String(cb.from.id),Number(payload.page)||0);
   else if (payload.view==='user' && validUserId(String(payload.id))) await userDetail(e,job,String(payload.id));
   else if (payload.view==='settings') await settingsPanel(e,job);
   else if (payload.view==='rules') await rulesPanel(e,job,String(cb.from.id));
+  else if (payload.view==='broadcast') await broadcastPanel(e,job,String(cb.from.id));
   await answer(e,job,cb.id,'已更新。',false);return;
+ }
+ if(a.kind.startsWith('broadcast_')) {
+  if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'广播管理仅限原 General 消息。');return;}
+  const text=await handleBroadcastAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today'));
+  await answer(e,job,cb.id,text,false);return;
  }
  if(a.kind.startsWith('rule_')) {
   if(!isGeneral(m)||payload.messageId!==m.message_id) {await answer(e,job,cb.id,'规则管理仅限原 General 消息。');return;}
+  await closeBroadcastSession(e,String(cb.from.id));
   let answered=false;
   const text=await handleRuleAction(e,job,a,payload,stamp,String(cb.from.id),waitUntil,()=>panel(e,job,String(cb.from.id),'today'),async message=>{await answer(e,job,cb.id,message,false);answered=true;});
   if(!answered)await answer(e,job,cb.id,text,false);return;
@@ -590,6 +599,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
  if (!m || String(m.chat.id)!==e.ADMIN_CHAT_ID) return false;
  if (!authorized(e,String(m.from?.id)) || m.sender_chat || m.from?.is_bot) return true;
  if (internalForward(e,m)) return true;
+ if(await handleBroadcastInput(e,job,update,waitUntil))return true;
  if(await handleRuleInput(e,job,update,waitUntil))return true;
  const text = m.text ?? '';
  const command = /^\/([a-zA-Z]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(text);
@@ -626,6 +636,7 @@ export async function handleAdmin(e: Env, job: Job, update: TGUpdate, waitUntil?
  const [view,...rest] = args.split(/\s+/);
  const value = rest.join(' ');
  if (!view || ['today','7','30','all'].includes(view)) await panel(e,job,String(m.from!.id),(view || 'today') as Range);
+ else if(view==='broadcast') await broadcastPanel(e,job,String(m.from!.id));
  else if(view==='rules') await handleRuleCommand(e,job,String(m.from!.id),args.slice('rules'.length).trim(),waitUntil);
  else if (view==='users') await usersPage(e,job,String(m.from!.id),Math.max(0,Number(rest[0] ?? 1)-1));
  else if ((view==='search' || view==='user') && validUserId(value)) await userDetail(e,job,value);

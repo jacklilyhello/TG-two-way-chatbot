@@ -114,10 +114,17 @@ test('inventory and creation execute inside the locked job after current main sa
   assert.doesNotMatch(operate, /working-directory:/, 'Application src and migrations must remain rooted at the selected release');
   assert.doesNotMatch(operate, /run: node scripts\/(?:check-instances|deploy-instance)\.mjs/);
   assert.match(operate, /name: Remove private temporary files\n        if: always\(\)\n        run: rm -rf \.local \.deployment-control/);
-  for (const secret of ['INSTANCE_CONFIG_JSON', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_WEBHOOK_SECRET']) {
+  for (const secret of ['INSTANCE_CONFIG_JSON', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_WEBHOOK_SECRET', 'BROADCAST_TEST_RECIPIENT_IDS']) {
     assert.match(operate, new RegExp(`${secret}: \\$\\{\\{ secrets\\.${secret} \\}\\}`));
     assert.doesNotMatch(operate, new RegExp(`secrets\\.${secret}\\s*\\|\\|`));
   }
+});
+
+test('broadcast test recipient restriction remains a selected Environment Secret outside dispatch inputs', () => {
+  const inputs = workflow.slice(workflow.indexOf('    inputs:'), workflow.indexOf('permissions:'));
+  assert.doesNotMatch(inputs, /BROADCAST_TEST_RECIPIENT_IDS/);
+  assert.doesNotMatch(operate, /vars\.BROADCAST_TEST_RECIPIENT_IDS/);
+  assert.match(operate, /BROADCAST_TEST_RECIPIENT_IDS: \$\{\{ secrets\.BROADCAST_TEST_RECIPIENT_IDS \}\}/);
 });
 
 test('the main control checker reads its own manifests even when the application working directory differs', () => {

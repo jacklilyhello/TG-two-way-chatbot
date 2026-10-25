@@ -2,6 +2,7 @@ import type {Env,Params} from './types';
 import type {Outcome,IssueGuard} from './operations';
 import {dueReceiptCleanup,receiptGuardValid} from './receipts';
 import {deliveryRetryGuardValid} from './delivery-retry';
+import {broadcastGuardValid} from './broadcast-guard';
 const allowed = new Set(['getMe','getChat','getChatMember','getUserProfilePhotos','createForumTopic','editForumTopic','sendMessage','sendPhoto','sendMediaGroup','copyMessage','editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','pinChatMessage','unpinChatMessage','setMessageReaction','deleteMessage','answerCallbackQuery','setMyCommands']);
 const nonSending = new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','deleteMessage','unpinChatMessage']);
 const priorityEdits=new Set(['editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup']);
@@ -14,6 +15,7 @@ export class BotCoordinator {
  private tail:Promise<unknown>=Promise.resolve();
  private callbackTail:Promise<unknown>=Promise.resolve();
  private cardControlTail:Promise<unknown>=Promise.resolve();
+ private broadcastTail:Promise<unknown>=Promise.resolve();
  private controlRequests=new Map<string,Promise<unknown>>();
  private reservationTail:Promise<unknown>=Promise.resolve();
  constructor(private state:DurableObjectState,private env:Env){}
@@ -22,25 +24,29 @@ export class BotCoordinator {
   const body=journal?null:await request.clone().json<RequestBody>();
   const callback=body?.method==='answerCallbackQuery';
   const cardControl=body?.guard?.priority==='moderation-card'&&priorityEdits.has(body.method)&&Number.isSafeInteger(body.guard.threadVersion?.moderationVersion);
+  const broadcast=!!body?.guard?.broadcast;
   let queuedMs=0,localWaitMs=0,scheduledMs=0,waits=0;
   for(;;) {
    const queuedAt=Date.now();
    // Callback acknowledgements do not send a chat message. Their own durable
    // lane can return an already-committed result while a business API request
    // is still waiting for Telegram, without relaxing send/mutation pacing.
-   const result=(callback?this.callbackTail:cardControl?this.cardControlTail:this.tail).then(async()=>{
+   const result=(callback?this.callbackTail:cardControl?this.cardControlTail:broadcast?this.broadcastTail:this.tail).then(async()=>{
     queuedMs+=Math.max(0,Date.now()-queuedAt);
     const attempt=request.clone();
+    // A clear can recover a broadcast operation through the ordinary lane.
+    // Wait for its active request before reading/sealing the response journal.
+    if(!journal&&!callback&&!cardControl&&!broadcast)await this.controlRequests.get(body!.key)?.catch(()=>{});
     return journal?this.journal(attempt):this.execute(attempt);
    });
-   if(callback||cardControl){
-    if(callback)this.callbackTail=result.catch(()=>{});else this.cardControlTail=result.catch(()=>{});
+   if(callback||cardControl||broadcast){
+    if(callback)this.callbackTail=result.catch(()=>{});else if(cardControl)this.cardControlTail=result.catch(()=>{});else this.broadcastTail=result.catch(()=>{});
     this.controlRequests.set(body!.key,result);
    }
    else this.tail=result.catch(()=>{});
    let response:Response;
    try {response=await result;}
-   finally {if((callback||cardControl)&&this.controlRequests.get(body!.key)===result)this.controlRequests.delete(body!.key);}
+   finally {if((callback||cardControl||broadcast)&&this.controlRequests.get(body!.key)===result)this.controlRequests.delete(body!.key);}
    const localDue=response.headers.get(localRateDueHeader);
    response.headers.delete(localRateDueHeader);
    const delay=localDue===null?NaN:Math.max(0,Number(localDue)-Date.now());
@@ -97,7 +103,8 @@ export class BotCoordinator {
   const globalAt=await this.state.storage.get<number>('rate:global')??0;
   const backoffAt=await this.state.storage.get<number>('rate:backoff')??0;
   const chatAt=chat?await this.state.storage.get<number>(chatRateKey)??0:0;
-  const due=exempt?backoffAt:Math.max(globalAt,chatAt,backoffAt);
+  const broadcastAt=guard?.broadcast?await this.state.storage.get<number>('rate:broadcast')??0:0;
+  const due=exempt?backoffAt:Math.max(globalAt,chatAt,backoffAt,broadcastAt);
   const rateCheckedAt=Date.now();
   if(rateCheckedAt<due) return Response.json({due},{status:429,headers:!exempt&&backoffAt<=rateCheckedAt&&due-rateCheckedAt<=maxLocalWaitMs?{[localRateDueHeader]:String(due)}:{}});
   const checks:D1PreparedStatement[]=[];
@@ -106,14 +113,14 @@ export class BotCoordinator {
   const policyIndex=guard?.unblockedUser?(guard.unblockedUser===guard.threadVersion?.userId?bindingIndex:checks.push(this.env.DB.prepare('SELECT blocked FROM users WHERE tgid=?').bind(guard.unblockedUser))-1):-1;
   // Complex guards perform additional reads. Keep pause after those reads so
   // it remains the final safety check, while ordinary sends use one D1 batch.
-  const deferPause=!!(guard?.receipt||guard?.deliveryRetry);
+  const deferPause=!!(guard?.receipt||guard?.deliveryRetry||guard?.broadcast);
   const pauseIndex=!deferPause&&this.env.PAUSED!=='true'?checks.push(this.env.DB.prepare("SELECT key FROM settings WHERE key='paused' AND value='1'"))-1:-1;
   const checked=checks.length?await this.env.DB.batch(checks):[];
   if(guard) {
    const hidden=hiddenIndex>=0&&checked[hiddenIndex].results.length>0;
    const binding=bindingIndex>=0?checked[bindingIndex].results[0] as {binding_version:number;thread_id:number;blocked:number;moderation_version:number}|undefined:undefined;
    const policy=policyIndex>=0?checked[policyIndex].results[0] as {blocked:number}|undefined:undefined;
-   if(hidden||(guard.unblockedUser&&policy?.blocked!==0)||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)||(guard.threadVersion.moderationVersion!==undefined&&binding?.moderation_version!==guard.threadVersion.moderationVersion)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))) {
+   if(hidden||(guard.unblockedUser&&policy?.blocked!==0)||(guard.threadVersion&&(binding?.binding_version!==guard.threadVersion.version||(guard.threadVersion.threadId!==undefined&&binding?.thread_id!==guard.threadVersion.threadId)||(guard.threadVersion.moderationVersion!==undefined&&binding?.moderation_version!==guard.threadVersion.moderationVersion)))||(guard.receipt&&!await receiptGuardValid(this.env,guard.receipt))||(guard.deliveryRetry&&!await deliveryRetryGuardValid(this.env,guard.deliveryRetry))||(guard.broadcast&&!await broadcastGuardValid(this.env,guard.broadcast,method,params))) {
     const outcome:Outcome={status:'failed',reason:'cancelled_by_state',code:409};
     await this.state.storage.put(journalKey,{phase:'done',outcome});return Response.json(outcome);
    }
@@ -122,7 +129,7 @@ export class BotCoordinator {
   if(paused)return Response.json({due:Date.now()+60000},{status:429});
   if(reaction && guard?.receipt && !guard.receipt.clear && guard.receipt.emoji==='👍' && await dueReceiptCleanup(this.env,Date.now()))return Response.json({due:Date.now()+100},{status:429});
   const messageCount=method==='sendMediaGroup'&&Array.isArray(params.media)?Math.max(1,params.media.length):1;
-  const reservation=(at:number)=>exempt?{}:{'rate:global':at+40*messageCount,...(chat?{[chatRateKey]:at+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})};
+  const reservation=(at:number)=>exempt?{}:{'rate:global':at+40*messageCount,...(guard?.broadcast?{'rate:broadcast':at+1050}:{}),...(chat?{[chatRateKey]:at+(reaction?1050:chat.startsWith('-')?3100:1050)*messageCount}:{})};
   await this.state.storage.put({[journalKey]:{phase:'issued'},...reservation(Date.now())});
   return {reservation};
   });
