@@ -3,7 +3,26 @@ import {all,now,one,run,stmt,wakeWork} from './db';
 import {call,notify,RetryLater,type Outcome} from './operations';
 
 export interface BroadcastContent {text?:string;photo?:string|null}
-export interface BroadcastRow {id:string;instance_id:string;bot_id:string;actor_id:string;epoch:string;text:string;photo:string|null;state:'draft'|'confirmed'|'sending'|'done'|'canceled'|'interrupted';total:number;snapshot_ready:number;created_at:number;started_at:number|null;completed_at:number|null;next_at:number;expected:number}
+export type BroadcastAudience={mode:'all'}|{mode:'directed';ids:string[]};
+export const MAX_BROADCAST_IDS=200;
+const invalidAudience=()=>new Error('invalid_broadcast_audience');
+const validAudienceId=(id:unknown):id is string=>typeof id==='string'&&/^[1-9]\d{0,15}$/.test(id)&&Number(id)<=4503599627370495;
+/** Canonical values make the requested range immutable across durable replays. */
+export function normalizeBroadcastAudience(input?:BroadcastAudience):BroadcastAudience {
+ if(input===undefined)return {mode:'all'};
+ if(!input||typeof input!=='object'||Array.isArray(input))throw invalidAudience();
+ if(input.mode==='all'){if(Object.keys(input).some(key=>key!=='mode'))throw invalidAudience();return {mode:'all'};}
+ if(input.mode!=='directed'||Object.keys(input).some(key=>key!=='mode'&&key!=='ids')||!Array.isArray(input.ids)||!input.ids.length||Array.from(input.ids).some(id=>!validAudienceId(id)))throw invalidAudience();
+ const ids=[...new Set(input.ids)].sort((a,b)=>Number(a)-Number(b));
+ if(ids.length>MAX_BROADCAST_IDS)throw invalidAudience();
+ return {mode:'directed',ids};
+}
+export function parseBroadcastIds(text:string):string[] {
+ if(typeof text!=='string')throw invalidAudience();
+ const audience=normalizeBroadcastAudience({mode:'directed',ids:text.split(/[\s,，]+/u).filter(Boolean)});
+ return (audience as {mode:'directed';ids:string[]}).ids;
+}
+export interface BroadcastRow {id:string;instance_id:string;bot_id:string;actor_id:string;epoch:string;text:string;photo:string|null;scope_json:string;state:'draft'|'confirmed'|'sending'|'done'|'canceled'|'interrupted';total:number;snapshot_ready:number;created_at:number;started_at:number|null;completed_at:number|null;next_at:number;expected:number}
 interface Recipient {broadcast_id:string;user_id:string;state:'pending'|'success'|'failed'|'unknown'|'skipped';part_index:number;success_parts:number;reason:string|null;code:number|null}
 export interface BroadcastStats {id:string;state:BroadcastRow['state'];total:number;expected:number;success:number;failed:number;unsent:number;unknown:number;partial:number;pending:number}
 export interface BroadcastGuard {id:string;userId:string;part:number}
@@ -30,16 +49,17 @@ export async function getBroadcast(e:Env,id:string):Promise<BroadcastRow|null> {
  const row=await one<BroadcastRow>(e,'SELECT *,total expected FROM broadcasts WHERE id=? AND instance_id=? AND bot_id=?',id,e.INSTANCE_ID,e.EXPECTED_BOT_ID);
  return row;
 }
-export async function prepareBroadcast(e:Env,input:BroadcastContent&{id:string;actor:string}):Promise<BroadcastRow> {
+export async function prepareBroadcast(e:Env,input:BroadcastContent&{id:string;actor:string;audience?:BroadcastAudience}):Promise<BroadcastRow> {
  const text=input.text??'',photo=input.photo??null,time=now(),scope=broadcastTestRecipients(e),scopeJSON=scope?JSON.stringify(scope):null;
+ const audience=normalizeBroadcastAudience(input.audience),audienceJSON=JSON.stringify(audience),directedJSON=audience.mode==='directed'?JSON.stringify(audience.ids):null;
  if(!authorized(e,input.actor)||!input.id||input.id.length>160||(!text&&!photo)||text.length>3500||photo!==null&&(typeof photo!=='string'||!photo||photo.length>1000))throw new Error('invalid_broadcast');
  await e.DB.batch([
-  stmt(e,"INSERT OR IGNORE INTO broadcasts(id,instance_id,bot_id,actor_id,epoch,text,photo,created_at) VALUES(?,?,?,?,?,?,?,?)",input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo,time),
-  stmt(e,"INSERT OR IGNORE INTO broadcast_recipients(broadcast_id,user_id,updated_at) SELECT b.id,u.tgid,? FROM broadcasts b CROSS JOIN users u WHERE b.id=? AND b.instance_id=? AND b.bot_id=? AND b.actor_id=? AND b.epoch=? AND b.text=? AND b.photo IS ? AND b.state='draft' AND b.snapshot_ready=0 AND u.blocked=0 AND u.thread_id IS NOT NULL AND (? IS NULL OR u.tgid IN (SELECT value FROM json_each(?)))",time,input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo,scopeJSON,scopeJSON),
-  stmt(e,"UPDATE broadcasts SET total=(SELECT COUNT(*) FROM broadcast_recipients WHERE broadcast_id=broadcasts.id),snapshot_ready=1 WHERE id=? AND instance_id=? AND bot_id=? AND actor_id=? AND epoch=? AND text=? AND photo IS ? AND state='draft' AND snapshot_ready=0",input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo)
+  stmt(e,"INSERT OR IGNORE INTO broadcasts(id,instance_id,bot_id,actor_id,epoch,text,photo,scope_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo,audienceJSON,time),
+  stmt(e,"INSERT OR IGNORE INTO broadcast_recipients(broadcast_id,user_id,updated_at) SELECT b.id,u.tgid,? FROM broadcasts b CROSS JOIN users u WHERE b.id=? AND b.instance_id=? AND b.bot_id=? AND b.actor_id=? AND b.epoch=? AND b.text=? AND b.photo IS ? AND b.scope_json=? AND b.state='draft' AND b.snapshot_ready=0 AND u.blocked=0 AND u.thread_id IS NOT NULL AND (? IS NULL OR u.tgid IN (SELECT value FROM json_each(?))) AND (? IS NULL OR u.tgid IN (SELECT value FROM json_each(?)))",time,input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo,audienceJSON,scopeJSON,scopeJSON,directedJSON,directedJSON),
+  stmt(e,"UPDATE broadcasts SET total=(SELECT COUNT(*) FROM broadcast_recipients WHERE broadcast_id=broadcasts.id),snapshot_ready=1 WHERE id=? AND instance_id=? AND bot_id=? AND actor_id=? AND epoch=? AND text=? AND photo IS ? AND scope_json=? AND state='draft' AND snapshot_ready=0",input.id,e.INSTANCE_ID,e.EXPECTED_BOT_ID,input.actor,e.RECOVERY_EPOCH,text,photo,audienceJSON)
  ]);
  const row=await getBroadcast(e,input.id);
- if(!row||row.actor_id!==input.actor||row.epoch!==e.RECOVERY_EPOCH||row.text!==text||row.photo!==photo||!row.snapshot_ready)throw new Error('broadcast_snapshot_mismatch');
+ if(!row||row.actor_id!==input.actor||row.epoch!==e.RECOVERY_EPOCH||row.text!==text||row.photo!==photo||row.scope_json!==audienceJSON||!row.snapshot_ready)throw new Error('broadcast_snapshot_mismatch');
  return row;
 }
 export async function cancelBroadcast(e:Env,id:string,actor:string):Promise<void> {
@@ -95,7 +115,11 @@ export function broadcastSummary(stats:BroadcastStats):string {
 async function finish(e:Env,b:BroadcastRow) {
  await run(e,"UPDATE broadcasts SET state='done',completed_at=COALESCE(completed_at,?) WHERE id=? AND state='sending' AND NOT EXISTS(SELECT 1 FROM broadcast_recipients WHERE broadcast_id=? AND state='pending')",now(),b.id,b.id);
  const stats=await broadcastStats(e,b.id);
- if(stats?.state==='done')await notify(e,`broadcast-report:${b.id}`,null,`广播已结束\n目标机器人：${b.instance_id}\n${broadcastSummary(stats)}\n成功仅表示 Telegram API 已确认，不代表已读。未知结果保留，不自动重发。`);
+ if(stats?.state==='done') {
+  let audienceLabel='范围异常';
+  try {const audience=normalizeBroadcastAudience(JSON.parse(b.scope_json));audienceLabel=audience.mode==='all'?'全体用户':`定向（指定 ${audience.ids.length} 个 ID）`;}catch{/* A corrupt range cannot become all-users or prevent the result report. */}
+  await notify(e,`broadcast-report:${b.id}`,null,`广播 ${b.id.slice(0,8)} 已结束\n目标机器人：${b.instance_id}\n范围：${audienceLabel}\n${broadcastSummary(stats)}\n成功仅表示 Telegram API 已确认，不代表已读。未知结果保留，不自动重发。`);
+ }
 }
 /** One recipient at a time, with a persistent interval between recipients.
  * RetryLater releases the dedicated broadcast coordinator instead of occupying
