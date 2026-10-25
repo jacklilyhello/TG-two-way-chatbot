@@ -62,7 +62,8 @@ export function assertProjectWorkerIsolation(config, workers) {
     const bindings = settings?.bindings;
     if (!Array.isArray(bindings)) throw new Error('Worker binding inventory is incomplete; inspect account Worker settings before retrying');
     const markers = ['INSTANCE_ID', 'EXPECTED_BOT_ID', 'ADMIN_CHAT_ID'];
-    const isProject = name.startsWith('tg-two-way-') || bindings.some(binding => markers.includes(binding.name));
+    const projectNamespace = name.startsWith('tg-two-way-');
+    const isProject = projectNamespace || bindings.some(binding => markers.includes(binding.name));
     if (!isProject) continue;
     const text = key => {
       const matches = bindings.filter(binding => binding.name === key);
@@ -75,7 +76,11 @@ export function assertProjectWorkerIsolation(config, workers) {
     if (!/^[a-z][a-z0-9-]{0,30}$/.test(instance ?? '') || !/^[1-9]\d{0,15}$/.test(bot ?? '') || !Number.isSafeInteger(Number(bot)) || !/^-100\d{5,15}$/.test(chat ?? '') || !Number.isSafeInteger(Number(chat))) throw ownershipError();
     const drillRun = text('DRILL_RUN_ID');
     const isDrill = ['test-a', 'test-b'].includes(instance) && /^\d{1,20}-\d{1,3}$/.test(drillRun ?? '') && name === `tg-two-way-${instance}-reliability-${drillRun}`;
-    if (name !== `tg-two-way-${instance}`) {
+    // Other applications can use the same identity field names. Validate their
+    // complete identity and collisions, but only our namespace claims our
+    // canonical instance/drill naming. Resource sharing is checked for every
+    // account Worker by runInstance before any mutation.
+    if (projectNamespace && name !== `tg-two-way-${instance}`) {
       if (!isDrill || bot !== '42424240' || chat !== '-1004242424242') throw ownershipError();
       try {
         const db = bindings.find(binding => binding.name === 'DB');
@@ -83,7 +88,7 @@ export function assertProjectWorkerIsolation(config, workers) {
       } catch { throw ownershipError(); }
     }
     if (name === config.worker_name) continue;
-    if (!isDrill && instance === config.instance_id) throw new Error('Selected instance identity is claimed by another Worker; inspect project Worker settings');
+    if (projectNamespace && !isDrill && instance === config.instance_id) throw new Error('Selected instance identity is claimed by another Worker; inspect project Worker settings');
     if (bot === config.expected_bot_id) throw new Error('Expected Bot is already bound to another project Worker');
     if (chat === config.admin_chat_id) throw new Error('Admin Forum is already used by another project instance; select a separate Forum group in this Environment INSTANCE_CONFIG_JSON');
   }
